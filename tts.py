@@ -4,17 +4,14 @@ import pyttsx3
 engine = pyttsx3.init()
 
 # Load your text file
-file_path = 'c:\somewhere\file.txt'  # Replace with the path to your text file
+file_path = r'C:\some\path\file\filename.txt'  
+# Adjust the path as needed
 with open(file_path, 'r', encoding='utf-8') as file:
     text = file.read()
 
 # Set voice properties (optional)
-engine.setProperty('rate', 150)  # Speed (default is usually 200)
-engine.setProperty('volume', 1.0)  # Volume (max is 1.0)
-
-# Choose a voice (optional)
-voices = engine.getProperty('voices')
-engine.setProperty('voice', voices[0].id)  # Use voices[1].id for a different voice (e.g., female)
+engine.setProperty('rate', 150)  # Speed
+engine.setProperty('volume', 1.0)  # Volume
 
 # Convert text to speech
 engine.save_to_file(text, 'output_audio.mp3')  # Save as an audio file
