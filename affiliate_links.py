@@ -13,8 +13,8 @@ output_filename = input("Enter the output filename (with extension): ")
 amazon_link_pattern = r"https://www\.amazon\.com/dp/[\w\d]+"
 
 try:
-    # Read the input file
-    with open(input_filename, 'r') as file:
+    # Read the input file with UTF-8 encoding
+    with open(input_filename, 'r', encoding='utf-8') as file:
         content = file.read()
     
     # Find all Amazon links in the file
@@ -29,13 +29,15 @@ try:
     # Remove Roman numeral section headings
     content = re.sub(r"^\s*[IVXLCDM]+\.\s*", "", content, flags=re.MULTILINE)
     
-    # Write the updated content to the output file
-    with open(output_filename, 'w') as file:
+    # Write the updated content to the output file with UTF-8 encoding
+    with open(output_filename, 'w', encoding='utf-8') as file:
         file.write(content)
     
     print(f"File successfully processed. Updated content saved to: {output_filename}")
 
 except FileNotFoundError:
     print(f"Error: The file '{input_filename}' was not found. Please check the filename and try again.")
+except UnicodeDecodeError as e:
+    print(f"Error reading the file: {e}. Ensure the file is encoded in UTF-8 or try specifying the correct encoding.")
 except Exception as e:
     print(f"An unexpected error occurred: {e}")
