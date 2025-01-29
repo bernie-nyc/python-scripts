@@ -1,5 +1,5 @@
-pip install --upgrade pymupdf
-pip install --upgrade fitz
+pip install pymupdf
+pip install fitz
 pip install pymupdf
 
 import fitz  # PyMuPDF
