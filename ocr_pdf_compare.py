@@ -1,6 +1,7 @@
 #pip install pymupdf
 #pip install fitz
 #pip install pymupdf
+
 import fitz  # PyMuPDF
 import difflib
 import os
