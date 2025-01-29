@@ -1,9 +1,15 @@
 pip install --upgrade pymupdf
 pip install --upgrade fitz
+pip install pymupdf
 
 import fitz  # PyMuPDF
 import difflib
 import os
+import re
+
+def extract_words(text):
+    """Extract words while ignoring punctuation and special characters."""
+    return re.findall(r'\b\w+\b', text.lower())
 
 def compare_documents():
     print("\n--- Document Comparison Tool ---")
@@ -32,11 +38,11 @@ def compare_documents():
         source_page = source_doc[page_num]
         comparison_page = comparison_doc[page_num]
 
-        # Extract words from pages
-        source_words = source_page.get_text("text").split()
-        comparison_words = comparison_page.get_text("text").split()
+        # Extract normalized words
+        source_words = extract_words(source_page.get_text("text"))
+        comparison_words = extract_words(comparison_page.get_text("text"))
 
-        # Compute differences using difflib
+        # Compute true word-level differences
         diff = list(difflib.ndiff(source_words, comparison_words))
 
         added_words = {word[2:] for word in diff if word.startswith('+ ')}
