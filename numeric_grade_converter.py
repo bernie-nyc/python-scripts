@@ -1,7 +1,7 @@
 import openpyxl
 from openpyxl.utils import get_column_letter
 
-# Load your Excel file - change the filename to what you need it to be
+# Load your Excel file
 file_path = "Grade Data Pulls (1).xlsx"
 workbook = openpyxl.load_workbook(filename=file_path)
 
@@ -9,27 +9,29 @@ workbook = openpyxl.load_workbook(filename=file_path)
 grade_convert_sheet = workbook["Grade Convert"]
 grade_conversion = {}
 
-# Build the conversion dictionary from column B (letter grade) to column G (numeric value)
+# Build the conversion dictionary (column B to G)
 for row in grade_convert_sheet.iter_rows(min_row=2, min_col=2, max_col=7):
-    letter_grade = row[0].value
-    numeric_value = row[5].value
-    if letter_grade is not None and numeric_value is not None:
-        grade_conversion[letter_grade] = numeric_value
+    letter = row[0].value
+    value = row[5].value
+    if letter is not None and value is not None:
+        grade_conversion[str(letter).strip().upper()] = value
 
-# Define the target columns (N to T => columns 14 to 20)
+# Define the range N to T (columns 14 to 20)
 columns_to_update = [get_column_letter(col) for col in range(14, 21)]
 
-# Loop through all worksheets except "Grade Convert"
+# Process all sheets except "Grade Convert"
 for sheet_name in workbook.sheetnames:
     if sheet_name != "Grade Convert":
         sheet = workbook[sheet_name]
-        for row in sheet.iter_rows(min_row=2):  # skip header row
+        for row in sheet.iter_rows(min_row=2):
             for col_letter in columns_to_update:
                 cell = sheet[f"{col_letter}{row[0].row}"]
-                if cell.value in grade_conversion:
-                    cell.value = grade_conversion[cell.value]
+                if isinstance(cell.value, str):
+                    clean_val = cell.value.strip().upper()
+                    if clean_val in grade_conversion:
+                        cell.value = grade_conversion[clean_val]
 
-# Save the updated workbook
+# Save the updated file
 output_path = "Grade_Data_Pulls_Converted.xlsx"
 workbook.save(output_path)
-print(f"Updated file saved as: {output_path}")
+print(f"✅ Conversion complete. File saved as: {output_path}")
