@@ -1,7 +1,7 @@
 import openpyxl
 from openpyxl.utils import get_column_letter
 
-# Load your Excel file
+# Load your Excel file - change the filename to what you need it to be
 file_path = "Grade Data Pulls (1).xlsx"
 workbook = openpyxl.load_workbook(filename=file_path)
 
