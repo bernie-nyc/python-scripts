@@ -44,7 +44,7 @@ new_person_flags = []     # List to store YES/NO if person is new
 print("Starting fuzzy address matching...")
 
 # The tqdm() function shows a live progress bar in the terminal
-for row in tqdm(dev_batch.itertuples(index=False), total=len(dev_batch), desc="Matching"):
+for i, row in tqdm(dev_batch.iterrows(), total=len(dev_batch), desc="Matching"):
     pid, new_flag = best_address_match(row)
     person_ids.append(pid)
     new_person_flags.append(new_flag)
