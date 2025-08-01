@@ -3,76 +3,77 @@
 Script: Word to PDF Batch Converter
 
 Purpose:
-Traverses the current directory and all its subdirectories, finds all Microsoft Word files (.doc and .docx), and converts each to a PDF document with the same name in the same directory.
+Traverses the current directory and all its subdirectories, finds Microsoft Word files (.doc and .docx), and converts each into a PDF document with an identical name in the same directory.
 
 Prerequisites and Dependencies:
-- Python 3 must be installed.
-- Install Python library 'docx2pdf' by running the command:
+- Python 3.x installed.
+- Microsoft Office (Word) installation required (Windows users):
+    - docx2pdf uses Word's COM interface for conversion.
+    - Office must be fully installed, activated, and licensed.
+- Install the Python library 'docx2pdf':
     pip install docx2pdf
-- LibreOffice and 'unoconv' are required to convert older '.doc' files:
-    - On Ubuntu/Linux, install by running:
-        sudo apt install libreoffice unoconv
-    - For Windows, LibreOffice and unoconv must be installed and accessible via the system PATH.
+- To convert older '.doc' files or if Microsoft Word isn't available:
+    - LibreOffice and 'unoconv' must be installed.
+        - Ubuntu/Linux:
+            sudo apt install libreoffice unoconv
+        - Windows:
+            - Install LibreOffice: https://www.libreoffice.org/download/download/
+            - Install unoconv: https://github.com/unoconv/unoconv
+            - Add LibreOffice and unoconv to the PATH environment variable.
 
 Usage:
-Simply execute the script from your desired root folder. PDF files will appear alongside the original Word documents.
+Run this script from the desired root directory. Converted PDFs will appear in the source document directories.
 
 """
 
-# Import necessary Python libraries/modules
-import os  # Allows access and navigation of the file system
-import subprocess  # Used to run external programs (LibreOffice via unoconv)
-from docx2pdf import convert  # Library to convert .docx files to PDF easily
+# Import Python libraries
+import os  # Enables interaction with the file system
+import subprocess  # Runs external commands (LibreOffice/unoconv)
+from docx2pdf import convert  # Converts .docx using Microsoft Word
 
 def convert_to_pdf(input_file, output_file):
     """
-    Converts a Word document to PDF format.
+    Converts Word documents (.docx or .doc) to PDF format.
 
     Parameters:
-    - input_file: Path to the original Word file (.doc or .docx).
-    - output_file: Desired path of the resulting PDF file.
+    - input_file: Path to the Word document.
+    - output_file: Path for saving the converted PDF.
     """
-    # Extract the file extension to decide conversion method
     ext = os.path.splitext(input_file)[1].lower()
 
-    # If the document is a modern Word document (.docx)
+    # Conversion method depends on file extension
     if ext == ".docx":
-        # Convert using docx2pdf library
+        # Uses docx2pdf (requires Microsoft Word on Windows)
         convert(input_file, output_file)
-
-    # If the document is an older Word format (.doc)
     elif ext == ".doc":
-        # Convert using the external program unoconv (LibreOffice must be installed)
+        # Uses LibreOffice/unoconv for older .doc files
         subprocess.run(['unoconv', '-f', 'pdf', '-o', output_file, input_file], check=True)
 
 def traverse_and_convert(root_dir):
     """
-    Traverses directories starting from 'root_dir', converting all Word documents found.
+    Navigates directories starting from 'root_dir', converting Word files to PDFs.
 
     Parameters:
-    - root_dir: The root directory from which the traversal begins.
+    - root_dir: Root directory from which traversal begins.
     """
-    # Walk through all directories and subdirectories
+    # Walk through directories and subdirectories
     for dirpath, _, filenames in os.walk(root_dir):
         for file in filenames:
-            # Check if the file ends with .doc or .docx (case-insensitive)
+            # Check for Word documents (.doc and .docx)
             if file.lower().endswith((".doc", ".docx")):
-                # Create full path to the original Word document
+                # Paths for input Word and output PDF files
                 doc_path = os.path.join(dirpath, file)
-                # Define the PDF file path (same name, same directory, .pdf extension)
                 pdf_path = os.path.splitext(doc_path)[0] + ".pdf"
                 try:
-                    # Attempt to convert the Word document to PDF
+                    # Attempt conversion and notify success
                     convert_to_pdf(doc_path, pdf_path)
-                    # Inform the user upon successful conversion
                     print(f"Converted: {doc_path} -> {pdf_path}")
                 except Exception as e:
-                    # Inform the user if conversion fails, and provide the error details
+                    # Notify if conversion fails and display error
                     print(f"Failed to convert: {doc_path}. Reason: {e}")
 
-# Main entry-point of the script
 if __name__ == "__main__":
-    # Set the root directory to the current working directory (directory where script is executed)
+    # Set current directory as starting point
     root_directory = os.getcwd()
-    # Begin traversing directories and converting documents
+    # Begin the conversion process
     traverse_and_convert(root_directory)
