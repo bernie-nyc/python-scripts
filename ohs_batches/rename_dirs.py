@@ -2,164 +2,181 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-rename_dirs.py  —  Meticulously commented directory renamer for non-coders
+PURPOSE
 ================================================================================
+Rename each TOP-LEVEL folder in the current directory when its name equals a
+Legacy Person ID (8 digits) found in a CSV. The new folder name format is:
 
-GOAL
-----
-Rename folders whose names are legacy IDs so that each folder name becomes:
-    <LegacyID>_<PersonID>_<Full Name>
+    <PersonID>_<Full Name>_<LegacyID>
 
-EXAMPLE
--------
+Examples
+--------
 Before:  12345678
-After:   12345678_104942_Abdulraheem, Hanan
+After:   104942_Abdulraheem, Hanan_12345678
 
-DATA INPUTS (expected to be in the SAME folder where you run this script)
------------------------------------------------------------------------
-1) folder_legacyid.txt
-   - One legacy ID per line.
-   - Each legacy ID should match an existing folder name that you want to rename.
-
-2) Person Query CSV (example filename below)
-   - Must contain EXACT column headers:
-        "Person ID", "Full Name", "Legacy Person ID"
-   - Example filename used in this script:
-        "Person Query (1582 records) 2025-08-23.csv"
-   - If your CSV has a different name, change PERSON_CSV_FILE below.
-
-SAFETY
-------
-- Default mode is DRY RUN (no changes). It will only PRINT what it WOULD do.
-- Use the --apply switch to actually rename folders.
-- The script NEVER overwrites an existing folder:
-    If the target name already exists, it adds "_1", "_2", ... until unique.
-
-WINDOWS NAME SAFETY
--------------------
-- Removes characters that Windows does not allow in folder names.
-- Removes illegal trailing dots/spaces.
-- Avoids reserved device names (e.g., CON, NUL, COM1).
+Key Points
+----------
+- ONLY folders directly under the folder where you run this script are considered.
+- The script MATCHES a folder by normalizing its name to digits and requiring 8.
+- The CSV must have columns exactly:
+      "Person ID", "Full Name", "Legacy Person ID"
+- The script trims spaces:
+    * Leading/trailing spaces are removed from CSV fields.
+    * Multiple internal whitespace characters are collapsed to a single space.
+- Windows-safe naming:
+    * Illegal characters are replaced with underscores.
+    * Trailing dots/spaces are removed.
+    * Reserved device names (CON, NUL, COM1, etc.) are avoided.
+- The script NEVER overwrites: it adds "_1", "_2", ... if a collision occurs.
+- Default is DRY RUN (no changes). Add --apply to actually rename.
 
 USAGE
 -----
-Open PowerShell (or Command Prompt) in the folder that contains:
-  - this script
-  - folder_legacyid.txt
-  - the Person Query CSV
-Then run:
-
-  1) DRY RUN (no changes):
-        python rename_dirs.py
-
-  2) APPLY CHANGES:
-        python rename_dirs.py --apply
-
-WHAT IF SOMETHING FAILS?
-------------------------
-- The script prints an error and continues with the next folder.
-- Nothing is deleted. Only folder names are changed.
+1) Open PowerShell or CMD in the directory containing your target folders and CSV.
+2) Preview (no changes):
+       python rename_dirs_from_csv_prefix.py --csv "Person Query (1582 records) 2025-08-23.csv"
+3) Apply changes:
+       python rename_dirs_from_csv_prefix.py --csv "Person Query (1582 records) 2025-08-23.csv" --apply
 
 ================================================================================
 """
 
-# ------------------------------
-# IMPORTS: built-in Python tools
-# ------------------------------
-import argparse          # Reads command-line options like --apply
-import csv               # Reads the Person Query CSV file
-import os                # Used only for environment basics (Path does the heavy lifting)
-import re                # Regular expressions for name sanitization
-from pathlib import Path # Safer path handling than raw strings (works on Windows)
-from typing import Dict, Tuple, Set
-
-# ------------------------------
-# USER-ADJUSTABLE FILENAMES
-# ------------------------------
-# Name of the text file with one legacy ID per line
-LEGACY_LIST = "folder_legacyid.txt"
-
-# Name of the CSV file with the required columns
-# If your file has a different name, change this string to match your file.
-PERSON_CSV_FILE = "Person Query (1582 records) 2025-08-23.csv"
+# ==============================================================================
+# IMPORTS: standard-library only; no external dependencies
+# ==============================================================================
+import argparse      # Parse command-line options like --csv and --apply
+import csv           # Read the CSV file using column names
+import re            # Regular expressions for cleaning/sanitizing text
+from pathlib import Path  # Robust path handling across operating systems
+from typing import Dict, Tuple, Iterable  # Type hints for clarity (optional)
 
 
 # ==============================================================================
-# HELPER FUNCTIONS — small, focused tasks with ultra-clear comments
+# LOW-LEVEL TEXT UTILITIES
 # ==============================================================================
 
-# ------------------------------
-# Windows filename sanitization
-# ------------------------------
-# 1) Define a set of characters that Windows forbids in file/folder names.
-#    <>:"/\|?* are illegal. Control chars \x00-\x1F are also invalid.
+# A. Characters that Windows forbids in file/folder names:
+#    < > : " / \ | ? * and ASCII control chars (0x00-0x1F).
 WIN_ILLEGAL = r'<>:"/\\|?*\x00-\x1F'
 
-# 2) Pre-compile a regular expression that finds any of the illegal characters.
-_illegal_re = re.compile(f"[{re.escape(WIN_ILLEGAL)}]")
+# Precompile regex that finds any illegal character (performance + clarity).
+_ILLEGAL_RE = re.compile(f"[{re.escape(WIN_ILLEGAL)}]")
 
-# 3) Trailing dots or spaces are not allowed on Windows folder names.
-_trailing_re = re.compile(r"[\. ]+$")
+# Windows forbids trailing spaces or dots in names. This regex removes them.
+_TRAILING_RE = re.compile(r"[\. ]+$")
 
-# 4) Windows has reserved device names that cannot be used as names, case-insensitive.
-_reserved: Set[str] = {
+# Windows reserved device base names (case-insensitive). "COM1".."COM9", "LPT1".."LPT9".
+_RESERVED = {
     "CON", "PRN", "AUX", "NUL",
     *{f"COM{i}" for i in range(1, 10)},
     *{f"LPT{i}" for i in range(1, 10)},
 }
 
+
+def digits_only(s: str) -> str:
+    """
+    PURPOSE
+    -------
+    Remove everything except digits 0-9.
+
+    WHY
+    ---
+    Folder names should match "Legacy Person ID" as 8 digits. Some names might
+    contain stray characters or spaces; this normalizes them.
+
+    EXAMPLE
+    -------
+    " 12 345 678 "  -> "12345678"
+    """
+    return re.sub(r"\D", "", s or "")
+
+
+def normalize_whitespace(s: str) -> str:
+    """
+    PURPOSE
+    -------
+    Trim leading/trailing whitespace AND collapse all internal whitespace runs
+    (spaces, tabs, newlines) to a single space.
+
+    EXAMPLES
+    --------
+    "  John   Q.   Public " -> "John Q. Public"
+    "Jane\tDoe"             -> "Jane Doe"
+    """
+    s = s or ""
+    # Strip ends
+    s = s.strip()
+    # Collapse any run of whitespace to a single space
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
 def sanitize_component(name: str) -> str:
     """
-    Make a single folder name 'component' safe for Windows.
+    PURPOSE
+    -------
+    Make a path "component" (one folder name) safe on Windows.
 
-    Steps:
-    - Replace every illegal character with underscore "_".
-    - Remove any trailing dots or spaces.
-    - If the result is empty, use "_" so it's still a valid name.
-    - If the name (before any dot) is a reserved device (like "CON"), append "_".
+    STEPS
+    -----
+    1) Replace illegal characters with underscores.
+    2) Remove any trailing dots/spaces at the end.
+    3) If the result is empty, use underscore.
+    4) If the base (before first dot) is a reserved device name (e.g., "CON"),
+       append underscore to avoid conflicts.
+
+    NOTE
+    ----
+    We KEEP spaces internally (Windows allows spaces), but we ensure they are
+    normalized beforehand via normalize_whitespace().
     """
-    # Replace illegal characters with underscore
-    out = _illegal_re.sub("_", name)
+    # Replace illegal characters
+    out = _ILLEGAL_RE.sub("_", name)
 
-    # Remove trailing dots/spaces that Windows forbids
-    out = _trailing_re.sub("", out)
+    # Remove trailing dots/spaces
+    out = _TRAILING_RE.sub("", out)
 
-    # If after cleaning nothing is left, fall back to "_"
+    # Avoid empty component
     if not out:
         out = "_"
 
-    # If the part before the first dot is a reserved device name, add "_" to avoid conflict
+    # Avoid reserved device names (consider the part before the first dot)
     base_before_dot = out.split(".", 1)[0]
-    if base_before_dot.upper() in _reserved:
-        out = f"{out}_"
+    if base_before_dot.upper() in _RESERVED:
+        out = out + "_"
 
     return out
 
 
 def ensure_unique_path(dst: Path) -> Path:
     """
-    Ensure 'dst' (the desired new folder path) does NOT already exist.
+    PURPOSE
+    -------
+    Guarantee that the returned path does NOT already exist. If 'dst' is free,
+    return it; otherwise append _1, _2, ... until a free name is found.
 
-    If it does not exist:
-        - Return 'dst' unchanged.
+    WHY
+    ---
+    Prevent accidental overwriting or collisions with existing folders.
 
-    If it DOES exist:
-        - Append a numeric suffix to the folder name:
-            <name>, <name>_1, <name>_2, ...
-          Stop at the first name that does not exist and return that.
-
-    This guarantees we never overwrite or collide with an existing folder.
+    EXAMPLE
+    -------
+    "104942_John Doe_12345678"
+    "104942_John Doe_12345678_1"
+    "104942_John Doe_12345678_2"
     """
-    # If the desired destination name is free, use it as-is.
     if not dst.exists():
         return dst
 
-    # Split name and extension-like tail. For folders, ".suffix" is usually empty,
-    # but we handle it generically.
+    # Work with the folder name. Folders typically have no extensions, but we
+    # handle "name.ext" generically just in case.
     name = dst.name
-    stem, dot, ext = name.partition(".")
+    if "." in name:
+        stem, ext = name.rsplit(".", 1)
+        dot = "."
+    else:
+        stem, ext, dot = name, "", ""
 
-    # Try adding _1, _2, ... until a free name is found.
     n = 1
     while True:
         candidate = dst.with_name(f"{stem}_{n}{dot}{ext}")
@@ -168,217 +185,224 @@ def ensure_unique_path(dst: Path) -> Path:
         n += 1
 
 
-def load_legacy_list(path: Path) -> Set[str]:
-    """
-    Read 'folder_legacyid.txt' and return a SET of legacy IDs.
-
-    - We use a set to avoid duplicates automatically.
-    - Empty lines are ignored.
-    - Leading/trailing spaces on each line are removed.
-    """
-    ids: Set[str] = set()  # Use a set so each ID is unique
-    with path.open("r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            s = line.strip()  # Remove leading/trailing whitespace/newlines
-            if s:              # Skip blank lines
-                ids.add(s)     # Add to the set (duplicates auto-ignored)
-    return ids
-
+# ==============================================================================
+# CSV LOADING
+# ==============================================================================
 
 def load_person_map(csv_path: Path) -> Dict[str, Tuple[str, str]]:
     """
-    Read the Person Query CSV and return a DICTIONARY mapping:
-        Legacy Person ID  -->  (Person ID, Full Name)
+    PURPOSE
+    -------
+    Read the "Person Query" CSV and build a fast lookup (dictionary) keyed by
+    normalized 8-digit "Legacy Person ID". The value for each key is a tuple:
+        (Person ID, Full Name)
 
-    Why a dictionary?
-        - So we can very quickly look up the (Person ID, Full Name)
-          for a given Legacy Person ID (which is the folder name).
+    BEHAVIOR
+    --------
+    - We normalize "Legacy Person ID" using digits_only() and REQUIRE exactly
+      8 digits to keep the entry.
+    - We trim/collapse spaces in "Person ID" and "Full Name" using
+      normalize_whitespace().
+    - We DO NOT change case or punctuation of "Full Name"; we only sanitize
+      later when building the final folder name.
+
+    RETURNS
+    -------
+    Dict[str, Tuple[str, str]]
+      Mapping: "12345678" -> ("104942", "Abdulraheem, Hanan")
     """
     mapping: Dict[str, Tuple[str, str]] = {}
 
-    # Open the CSV safely, ignoring weird characters if present.
     with csv_path.open("r", encoding="utf-8", errors="ignore", newline="") as f:
-        reader = csv.DictReader(f)  # Reads rows using column names
+        reader = csv.DictReader(f)  # Access columns by name
 
-        # We expect columns exactly named:
-        #   "Person ID", "Full Name", "Legacy Person ID"
+        # Validate the expected columns exist. If they don't, DictReader
+        # will return None for missing keys; our get() handles that safely.
         for row in reader:
-            legacy = (row.get("Legacy Person ID") or "").strip()
-            pid    = (row.get("Person ID")        or "").strip()
-            fname  = (row.get("Full Name")        or "").strip()
+            legacy_raw = row.get("Legacy Person ID", "")
+            pid_raw    = row.get("Person ID", "")
+            name_raw   = row.get("Full Name", "")
 
-            # If legacy is missing, we cannot map that row
-            if not legacy:
+            # Normalize each field:
+            legacy = digits_only(legacy_raw)                 # keep only digits
+            pid    = normalize_whitespace(pid_raw)           # trim + collapse spaces
+            name   = normalize_whitespace(name_raw)          # trim + collapse spaces
+
+            # Keep ONLY rows with an 8-digit legacy ID
+            if len(legacy) != 8:
                 continue
 
-            # Store the two useful pieces keyed by legacy
-            mapping[legacy] = (pid, fname)
+            mapping[legacy] = (pid, name)
 
     return mapping
 
 
 # ==============================================================================
-# MAIN PROGRAM — drives the whole process
+# DIRECTORY ENUMERATION
+# ==============================================================================
+
+def top_level_dirs(root: Path) -> Iterable[Path]:
+    """
+    PURPOSE
+    -------
+    Yield every immediate subdirectory of 'root'. Files are ignored.
+
+    NOTE
+    ----
+    We DO NOT recurse. Only folders directly under 'root' are considered.
+    """
+    for p in root.iterdir():
+        if p.is_dir():
+            yield p
+
+
+# ==============================================================================
+# MAIN ORCHESTRATION
 # ==============================================================================
 
 def main() -> None:
     """
-    Orchestrates the entire rename process, step by step:
-
-    1) Parse the --apply flag to decide DRY RUN vs APPLY.
-    2) Locate the working directory (where the script is run).
-    3) Load 'folder_legacyid.txt' into a set of legacy IDs.
-    4) Load the person CSV into a mapping: legacy ID -> (person id, full name).
-    5) For each legacy ID that also exists as a folder:
-         a) Build the new folder name: LegacyID_PersonID_FullName
-         b) Sanitize the new name (Windows safe)
-         c) Ensure uniqueness to avoid collisions
-         d) Print what would happen (DRY RUN) or perform the rename (APPLY)
-    6) Print a summary of results.
+    CONTROL FLOW (step-by-step)
+    ---------------------------
+    1) Parse command-line arguments:
+         --csv   : required path to the Person Query CSV
+         --apply : optional flag to actually perform renames
+    2) Resolve the current working directory ("root") where the script runs.
+    3) Load the CSV mapping of legacy -> (person id, full name).
+    4) Scan immediate subfolders under 'root'.
+    5) For each subfolder:
+         a) Normalize its name to digits only.
+         b) If exactly 8 digits and present in CSV mapping, build the NEW name:
+               <PersonID>_<Full Name>_<LegacyID>
+            with all components trimmed and Windows-sanitized.
+         c) If the destination name already exists, add _1, _2, ...
+         d) Add this pair (src -> dst) to a plan list.
+    6) Report the plan (how many will be renamed; show first 50).
+    7) If --apply was given, perform the rename operations and report success/fail.
+       Otherwise, end after the dry-run preview.
     """
-
-    # -------------------------------------------------------------------------
-    # STEP 1: Read command-line options
-    # -------------------------------------------------------------------------
+    # 1) Parse CLI args
     parser = argparse.ArgumentParser(
-        description="Rename folders from <LegacyID> to <LegacyID>_<PersonID>_<Full Name>."
+        description="Prefix top-level folders with PersonID and Full Name from CSV, keeping LegacyID at the end."
     )
-    # --apply means "actually do it". If omitted, we run in DRY RUN mode.
+    parser.add_argument(
+        "--csv",
+        required=True,
+        help="Path to the Person Query CSV with columns: 'Person ID', 'Full Name', 'Legacy Person ID'"
+    )
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="Perform renames. Omit this flag to preview (dry run)."
+        help="Actually perform the renames. If omitted, this is a dry run."
     )
     args = parser.parse_args()
-    apply_changes: bool = args.apply
 
-    # -------------------------------------------------------------------------
-    # STEP 2: Determine the 'root' folder (current working directory)
-    # -------------------------------------------------------------------------
-    root: Path = Path.cwd()  # Folder where you typed: python rename_dirs.py
+    # 2) Determine 'root' (where the script is run) and CSV path
+    root = Path.cwd()
+    csv_path = Path(args.csv)
+
+    # 2a) Basic existence check for the CSV
+    if not csv_path.exists():
+        print(f"ERROR: CSV not found: {csv_path}")
+        return
+
+    # 3) Load the mapping from CSV
+    person_map = load_person_map(csv_path)
+
+    # High-level status banner
     print(f"Working folder: {root}")
-    print(f"Mode: {'APPLY (will rename)' if apply_changes else 'DRY RUN (no changes)'}\n")
+    print(f"Usable CSV mappings (8-digit legacy keys): {len(person_map)}")
+    print(f"Mode: {'APPLY (will rename)' if args.apply else 'DRY RUN (no changes)'}\n")
 
-    # -------------------------------------------------------------------------
-    # STEP 3: Resolve the two input files and check they exist
-    # -------------------------------------------------------------------------
-    legacy_file: Path = root / LEGACY_LIST
-    person_csv:  Path = root / PERSON_CSV_FILE
+    # Statistics counters for transparency
+    planned = []            # list of (Path src, Path dst) to rename
+    skipped_non8 = 0        # folders whose names (digits-only) are not 8 digits
+    skipped_missing = 0     # folders with 8-digit names that are not in the CSV
+    skipped_already = 0     # folders already matching the intended name
 
-    # If the legacy list is missing, we cannot proceed.
-    if not legacy_file.exists():
-        print(f"ERROR: Required file not found: {legacy_file.name}")
-        return
+    # 4) Enumerate top-level subdirectories
+    for d in top_level_dirs(root):
+        # Normalize the folder name to just digits to test if it is an 8-digit legacy
+        legacy = digits_only(d.name)
 
-    # If the CSV is missing, we cannot map legacy IDs to person info.
-    if not person_csv.exists():
-        print(f"ERROR: Required file not found: {person_csv.name}")
-        print("TIP: If your CSV has a different name, edit PERSON_CSV_FILE at the top of this script.")
-        return
-
-    # -------------------------------------------------------------------------
-    # STEP 4: Load the legacy IDs and the person mapping
-    # -------------------------------------------------------------------------
-    legacy_ids: Set[str] = load_legacy_list(legacy_file)
-    print(f"Loaded {len(legacy_ids)} legacy ID(s) from {legacy_file.name}")
-
-    person_map: Dict[str, Tuple[str, str]] = load_person_map(person_csv)
-    print(f"Loaded {len(person_map)} mapping row(s) from {person_csv.name}\n")
-
-    # -------------------------------------------------------------------------
-    # STEP 5: Plan the renames
-    # -------------------------------------------------------------------------
-    # We will create a list of "tasks", each task is a pair:
-    #   (source_folder_path, destination_folder_path)
-    tasks: list[tuple[Path, Path]] = []
-
-    # Sort legacy IDs so output is stable and predictable
-    for legacy in sorted(legacy_ids):
-        # The "source" folder we hope to rename must exist right here under root
-        src_dir: Path = root / legacy
-
-        # If the folder doesn't exist, we skip it quietly (you can print if desired)
-        if not src_dir.exists() or not src_dir.is_dir():
-            # Uncomment the next line if you want to be notified about missing folders
-            # print(f"SKIP (folder not found): {legacy}")
+        if len(legacy) != 8:
+            # Not an 8-digit "Legacy Person ID"; ignore this folder
+            skipped_non8 += 1
             continue
 
-        # We need a row in the CSV where "Legacy Person ID" equals this folder name
         if legacy not in person_map:
-            print(f"SKIP (no CSV match): {legacy}")
+            # We have a plausible legacy folder, but there is no CSV match
+            skipped_missing += 1
             continue
 
-        # Extract Person ID and Full Name from the mapping dictionary
-        person_id, full_name = person_map[legacy]
+        # 5) Build the new name using CSV data
+        person_id_raw, full_name_raw = person_map[legacy]
 
-        # Sanitize each piece so it's safe on Windows:
-        # - legacy is already "folder name", but sanitize anyway for consistency
-        safe_legacy   = sanitize_component(legacy)
-        safe_personid = sanitize_component(person_id)
-        safe_fullname = sanitize_component(full_name)
+        # Trim and collapse spaces in both pieces (safety + cleanliness)
+        person_id_norm = normalize_whitespace(person_id_raw)
+        full_name_norm = normalize_whitespace(full_name_raw)
 
-        # Build the NEW folder name we want:
-        #   <LegacyID>_<PersonID>_<Full Name>
-        new_name: str = f"{safe_legacy}_{safe_personid}_{safe_fullname}"
+        # Sanitize for Windows filesystem (illegal chars, trailing dots/spaces, reserved names)
+        safe_pid  = sanitize_component(person_id_norm)
+        safe_name = sanitize_component(full_name_norm)
 
-        # Create a full path object for the destination folder
-        dst_dir: Path = root / new_name
+        # New folder name FORMAT:
+        #   <PersonID>_<Full Name>_<LegacyID>
+        new_name = f"{safe_pid}_{safe_name}_{legacy}"
 
-        # If that destination already exists, find a unique variant with _1/_2/etc.
-        dst_dir = ensure_unique_path(dst_dir)
+        # Compute a destination path object under the same root
+        dst = ensure_unique_path(root / new_name)
 
-        # IMPORTANT:
-        # If the computed destination name equals the current name (already renamed),
-        # we should skip to avoid a no-op (or confusing logs).
-        if dst_dir.name == src_dir.name:
-            # Already in desired format (or equivalent). Skip.
+        # If the computed destination name equals the current, nothing to do
+        if dst.name == d.name:
+            skipped_already += 1
             continue
 
-        # Add this planned operation to our task list
-        tasks.append((src_dir, dst_dir))
+        # Add to the plan list
+        planned.append((d, dst))
 
-    # Print a preview of what we will do
-    print(f"Planned renames: {len(tasks)}")
-    for src, dst in tasks:
+    # 6) Report the plan for verification
+    print(f"Planned renames: {len(planned)}")
+    print(f"  Skipped (folder name not 8 digits): {skipped_non8}")
+    print(f"  Skipped (no CSV match):           {skipped_missing}")
+    print(f"  Skipped (already correct):        {skipped_already}\n")
+
+    # Show up to first 50 planned renames for quick inspection
+    for src, dst in planned[:50]:
         print(f" - {src.name}  ->  {dst.name}")
+    if len(planned) > 50:
+        print(f"... and {len(planned)-50} more")
 
-    # If there is nothing to do, stop here
-    if not tasks:
+    # If nothing to do, exit now
+    if not planned:
         print("\nNothing to rename.")
         return
 
-    # -------------------------------------------------------------------------
-    # STEP 6: Execute the plan (or just preview if DRY RUN)
-    # -------------------------------------------------------------------------
-    if not apply_changes:
-        # DRY RUN: Only print what WOULD happen. No changes made.
+    # If this is DRY RUN, stop after preview
+    if not args.apply:
         print("\nDry run complete. Re-run with --apply to commit changes.")
         return
 
-    # APPLY mode: actually rename folders now.
+    # 7) APPLY MODE: perform the renames
     print("\nApplying renames...")
-    ok = 0   # count of successful renames
-    fail = 0 # count of failed renames
+    ok = 0
+    fail = 0
 
-    # Iterate over each planned (source, destination) pair
-    for src, dst in tasks:
+    for src, dst in planned:
         try:
-            # Perform the rename on disk
+            # The actual rename on disk happens here
             src.rename(dst)
             ok += 1
         except Exception as e:
-            # If something goes wrong (permissions, locked by another program, etc.),
-            # report the error and continue with the next one.
+            # If something goes wrong (locked folder, permissions, etc.), record it and keep going
             print(f"ERROR: {src.name} -> {dst.name}: {e}")
             fail += 1
 
-    # -------------------------------------------------------------------------
-    # STEP 7: Final summary
-    # -------------------------------------------------------------------------
-    print(f"\nDone. Successfully renamed: {ok}. Failed: {fail}.")
+    print(f"\nDone. Renamed: {ok}. Failed: {fail}.")
 
-# ------------------------------------------------------------------------------
-# Python entry point — this runs main() when you execute the script directly.
-# ------------------------------------------------------------------------------
+
+# ==============================================================================
+# ENTRY POINT
+# ==============================================================================
 if __name__ == "__main__":
     main()
