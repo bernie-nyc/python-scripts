@@ -1,53 +1,88 @@
 #!/usr/bin/env python3
 """
 ==============================================================
-De-duplicate repeated folder-key substrings in filenames
+Two-Pass Filename Normalizer using Folder's First 7 Characters
 ==============================================================
 
-WHAT THIS DOES (PLAIN LANGUAGE)
-- You run this script inside a "top" folder.
-- The script looks at every subfolder inside that top folder (not the top itself).
-- For each file it finds:
-    1) It takes the first 7 characters of that file's immediate parent folder name.
-       Example: folder "ADMISSI_extra" -> key "ADMISSI"
-    2) It looks at the file's "stem" (the filename without the extension).
-    3) If that 7-character key appears more than once in the stem, the script
-       reduces it so the key appears exactly once. The first occurrence stays;
-       all additional occurrences are removed.
-    4) The file extension is preserved.
-    5) If the new name already exists, the script avoids overwriting by adding
-       "_1", "_2", etc. before the extension.
+What this script does
+---------------------
+You run this script inside a TOP folder. It scans EVERY subfolder under it
+(files directly in TOP are ignored).
 
-SAFETY / HOW TO RUN
-- Default is DRY RUN (no changes). You see what *would* be renamed.
-- To actually rename files, add --apply on the command line.
+For each file in each subfolder, it performs TWO PASSES:
 
-Examples:
-    Preview only (no changes):
-        python dedupe_folder_key_in_filenames.py
+PASS 1: REMOVE
+  - Take the first 7 characters of the file's *immediate* parent folder name.
+    That 7-char string is called KEY.
+  - Remove ALL occurrences of KEY from the *filename stem* (the name without
+    the extension). This collapses repeated embedded copies of KEY.
 
-    Apply changes:
-        python dedupe_folder_key_in_filenames.py --apply
+PASS 2: ENFORCE PREFIX
+  - Ensure the filename now STARTS with exactly KEY.
+  - If it doesn’t, we add KEY in front of the stem (no extra separators).
+  - Result: each filename contains KEY exactly once, at the very beginning.
+
+Safety
+------
+- The script never overwrites an existing file. If the target name exists,
+  it auto-appends _1, _2, etc., before the extension.
+- Default is DRY RUN (no renames). Add --apply to actually rename files.
+
+Usage
+-----
+Preview (no changes):
+    python normalize_filenames_with_key.py
+
+Apply changes:
+    python normalize_filenames_with_key.py --apply
 """
 
-# ----------------------------
-# IMPORTS: ready-made utilities
-# ----------------------------
-import os                  # Directory walking across subfolders
-import sys                 # Low-level console output for smooth progress bar
-import argparse            # Command-line argument parsing (--apply)
-from pathlib import Path   # Convenient and safe path handling
-from typing import Tuple   # Type hints for clarity (not required to run)
+import os
+import sys
+import argparse
+from pathlib import Path
+from typing import List, Tuple
 
-# ----------------------------------------
-# TEXT UTILITY: ensure a destination is unique
-# ----------------------------------------
+# ----------------------------
+# Console progress bar utility
+# ----------------------------
+def render_progress(done: int, total: int, phase: str, extra: str = "", width: int = 40) -> None:
+    """
+    Draw a single-line progress bar:
+        [#####........] 12/100 | phase=PASS1 | removed=34
+
+    Parameters
+    ----------
+    done : int
+        Number of items processed so far.
+    total : int
+        Total number of items to process.
+    phase : str
+        A short label indicating which pass is running (e.g., PASS1, PASS2).
+    extra : str
+        Additional short status text to display to the right.
+    width : int
+        Visual width of the bar.
+    """
+    total = max(total, 1)  # avoid division by zero
+    ratio = min(max(done / total, 0.0), 1.0)
+    filled = int(ratio * width)
+    bar = "#" * filled + "." * (width - filled)
+    msg = f"\r[{bar}] {done}/{total} | phase={phase}"
+    if extra:
+        msg += f" | {extra}"
+    sys.stdout.write(msg)
+    sys.stdout.flush()
+    if done >= total:
+        sys.stdout.write("\n")
+
+# --------------------------
+# Safe unique destination path
+# --------------------------
 def unique_path(dst: Path) -> Path:
     """
-    If `dst` does not exist, return it unchanged.
-    If it exists, append _1, _2, ... before the extension until unique.
-
-    Why: We must never overwrite someone else's file accidentally.
+    Ensure we do not overwrite. If 'dst' exists, append _1, _2, ...
+    before the extension until unique, then return that path.
     """
     if not dst.exists():
         return dst
@@ -59,207 +94,184 @@ def unique_path(dst: Path) -> Path:
             return candidate
         n += 1
 
-# ----------------------------------------------------
-# CORE TEXT TRANSFORM: collapse repeated key occurrences
-# ----------------------------------------------------
-def collapse_to_single_occurrence(s: str, key: str) -> Tuple[str, int]:
+# -------------------------------------
+# Helpers for string and name processing
+# -------------------------------------
+SEP_SET = {"_", "-", " ", "."}  # characters we strip if they lead a name
+
+def strip_leading_separators(s: str) -> str:
     """
-    Input:
-      s   = the file's stem (name without extension)
-      key = the 7-character folder key
+    Remove leading separator characters repeatedly: _, -, space, or dot.
+    Example: "__- file" -> "file"
+    """
+    i = 0
+    while i < len(s) and s[i] in SEP_SET:
+        i += 1
+    return s[i:]
 
-    Output:
-      (new_string, removed_count)
-
-    Behavior:
-      - Keep the *first* occurrence of `key` exactly where it appears.
-      - Remove all subsequent occurrences.
-      - Count how many were removed.
+def remove_all_key_occurrences(stem: str, key: str) -> Tuple[str, int]:
+    """
+    Remove ALL non-overlapping occurrences of 'key' from 'stem'.
+    Return (new_stem, removed_count).
     """
     if not key:
-        return s, 0  # Edge case: empty key means nothing to do
-
-    i = 0
-    seen_first = False
-    out_chars = []
-    removed = 0
-    klen = len(key)
-
-    while i < len(s):
-        # Look ahead klen characters to see if they match key
-        if s[i:i + klen] == key:
-            if not seen_first:
-                # Preserve the very first occurrence
-                out_chars.append(key)
-                seen_first = True
-            else:
-                # Skip this repeated occurrence
-                removed += 1
-            i += klen
-        else:
-            # Keep ordinary characters
-            out_chars.append(s[i])
-            i += 1
-
-    return "".join(out_chars), removed
-
-# ----------------------------------------------
-# PROGRESS BAR: compact, in-place console display
-# ----------------------------------------------
-def render_progress(done: int, total: int, width: int,
-                    extra: str = "") -> None:
-    """
-    Draw a single-line progress bar such as:
-        Progress [#####........] 12/100 | extra info
-
-    - `done`  : how many units completed
-    - `total` : total units
-    - `width` : number of characters in the bar (visual width)
-    - `extra` : short status text shown to the right (optional)
-    """
-    total = max(total, 1)              # Avoid divide-by-zero
-    ratio = min(max(done / total, 0), 1)
-    filled = int(ratio * width)
-    bar = "#" * filled + "." * (width - filled)
-    msg = f"\rProgress [{bar}] {done}/{total}"
-    if extra:
-        msg += f" | {extra}"
-    sys.stdout.write(msg)
-    sys.stdout.flush()
-    if done >= total:
-        sys.stdout.write("\n")         # Newline at 100%
+        return stem, 0
+    count = stem.count(key)
+    if count == 0:
+        return stem, 0
+    new_stem = stem.replace(key, "")  # remove every occurrence
+    return new_stem, count
 
 # ------------------------
-# MAIN WORKFLOW CONTROLLER
+# Workload construction
 # ------------------------
-def main():
-    # Parse command-line arguments
-    parser = argparse.ArgumentParser(
-        description=(
-            "Scan all subfolders. If a file's name contains the parent folder's "
-            "first 7 characters multiple times, reduce it to a single occurrence."
-        )
-    )
-    parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Actually perform the renames. Omit for a dry run."
-    )
-    args = parser.parse_args()
-    apply_changes = args.apply
-
-    # Define the top folder as "where you run the script"
-    root = Path.cwd()
-    print(f"Root: {root}")
-    print(f"Mode: {'APPLY (renaming files)' if apply_changes else 'DRY RUN (no changes)'}")
-
-    # ---------------------------
-    # DISCOVER WORK: gather files
-    # ---------------------------
-    # We consider *only* files inside subfolders, not files directly in root.
-    workload = []  # list of (folder_path, file_name, key)
+def collect_files_under_subfolders(root: Path) -> List[Path]:
+    """
+    Build a list of Path objects for every file that resides in a subfolder
+    of 'root'. Files directly in 'root' are skipped.
+    """
+    files: List[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
         parent = Path(dirpath)
         if parent == root:
-            continue  # skip files at the top level
-        key = parent.name[:7]  # 7-character substring from the folder name
+            # Skip top-level files. Only process files inside subfolders.
+            continue
         for fname in filenames:
-            workload.append((parent, fname, key))
+            files.append(parent / fname)
+    return files
 
-    total_files = len(workload)
-    if total_files == 0:
-        print("No files found in subfolders. Nothing to do.")
-        return
+def folder_key_for(file_path: Path) -> str:
+    """
+    Derive KEY = the first 7 characters of the file's *immediate* parent folder name.
+    If the folder name is shorter than 7, use what exists.
+    """
+    return file_path.parent.name[:7]
 
-    # -----------------------------------------
-    # FIRST PASS: quick measurement for context
-    # -----------------------------------------
-    # Count how many files contain the key at least twice (i.e., need changes)
-    needs_change = 0
-    total_extra_occurrences = 0  # number of occurrences to be removed in total
+# ------------------------
+# Main two-pass procedure
+# ------------------------
+def pass1_remove(root: Path, files: List[Path], apply_changes: bool) -> Tuple[int, int]:
+    """
+    PASS 1: For each file, remove ALL occurrences of KEY from its stem, then
+    strip leading separators that may remain. If the name changes, rename it.
 
-    for parent, fname, key in workload:
-        stem = (parent / fname).stem
-        # Count raw occurrences in the stem
-        count = 0
-        if key:
-            # Simple non-overlapping count is acceptable since key length is fixed
-            i = 0
-            klen = len(key)
-            while i <= len(stem) - klen:
-                if stem[i:i + klen] == key:
-                    count += 1
-                    i += klen
-                else:
-                    i += 1
-
-        if count >= 2:
-            needs_change += 1
-            total_extra_occurrences += (count - 1)
-
-    print(f"Files scanned: {total_files}")
-    print(f"Files needing change: {needs_change}")
-    print(f"Extra occurrences to remove: {total_extra_occurrences}\n")
-
-    # --------------------------------
-    # SECOND PASS: do the work with UI
-    # --------------------------------
+    Returns (changed_count, total_key_occurrences_removed)
+    """
     changed = 0
-    unchanged = 0
     removed_total = 0
-
-    # Visual bar parameters
-    bar_width = 40
+    total = len(files)
     done = 0
+    render_progress(done, total, phase="PASS1", extra="removed=0")
 
-    # Initial draw of the progress bar
-    render_progress(done, total_files, bar_width, extra="removed=0")
-
-    for parent, fname, key in workload:
-        src = parent / fname
+    for src in files:
         stem, ext = src.stem, src.suffix
+        key = folder_key_for(src)
 
-        # Transform the stem: collapse repeated key to a single occurrence
-        new_stem, removed = collapse_to_single_occurrence(stem, key)
+        # Remove all instances of KEY from the filename stem
+        new_stem, removed = remove_all_key_occurrences(stem, key)
 
-        if removed == 0:
-            unchanged += 1
-        else:
-            # Build the destination and ensure uniqueness
-            dst = parent / f"{new_stem}{ext}"
+        # Clean leftover leading separators after removal
+        new_stem = strip_leading_separators(new_stem)
+
+        if removed > 0 and new_stem != stem:
+            dst = src.with_name(f"{new_stem}{ext}")
             dst = unique_path(dst)
+            if apply_changes:
+                try:
+                    src.rename(dst)
+                    changed += 1
+                    removed_total += removed
+                except Exception as e:
+                    sys.stdout.write(f"\nERROR (PASS1): {src.name} -> {dst.name}: {e}\n")
+            else:
+                changed += 1
+                removed_total += removed
 
-            # Report action (dry-run vs apply)
+        done += 1
+        render_progress(done, total, phase="PASS1", extra=f"removed={removed_total}")
+
+    return changed, removed_total
+
+def pass2_prefix(root: Path, files: List[Path], apply_changes: bool) -> int:
+    """
+    PASS 2: Ensure the filename starts with KEY exactly once.
+    After PASS 1, KEY should no longer appear elsewhere in the name.
+    If the name does not start with KEY, we prefix KEY (no extra separators).
+
+    Returns changed_count for PASS 2.
+    """
+    changed = 0
+    total = len(files)
+    done = 0
+    render_progress(done, total, phase="PASS2")
+
+    for src in files:
+        stem, ext = src.stem, src.suffix
+        key = folder_key_for(src)
+
+        # If already starts with KEY, nothing to do.
+        if key and not stem.startswith(key):
+            final_stem = f"{key}{stem}"  # enforce KEY at start
+            dst = src.with_name(f"{final_stem}{ext}")
+            dst = unique_path(dst)
             if apply_changes:
                 try:
                     src.rename(dst)
                     changed += 1
                 except Exception as e:
-                    # If rename fails, treat as unchanged but print error
-                    print(f"\nERROR: failed to rename '{src.name}': {e}")
+                    sys.stdout.write(f"\nERROR (PASS2): {src.name} -> {dst.name}: {e}\n")
             else:
-                # Dry-run: we only count and display; no rename occurs
                 changed += 1
 
-            removed_total += removed
-
-        # Update and redraw progress bar after each file
         done += 1
-        render_progress(
-            done, total_files, bar_width,
-            extra=f"removed={removed_total}"
-        )
+        render_progress(done, total, phase="PASS2")
 
-    # -------------
-    # FINAL SUMMARY
-    # -------------
-    print("\nSummary")
-    print(f"  Changed:           {changed} {'(applied)' if apply_changes else '(would apply)'}")
-    print(f"  Unchanged/skipped: {unchanged}")
-    print(f"  Occurrences removed: {removed_total}")
+    return changed
 
-# ---------------
-# SCRIPT ENTRYPOINT
-# ---------------
+# -------------
+# Entry point
+# -------------
+def main():
+    # Parse the --apply flag. Default is dry run.
+    ap = argparse.ArgumentParser(
+        description=("Two-pass normalization of filenames using the first 7 "
+                     "characters of each file's parent folder: "
+                     "PASS1 removes all occurrences; PASS2 enforces as prefix."))
+    ap.add_argument("--apply", action="store_true", help="Perform renames. Omit for dry run.")
+    args = ap.parse_args()
+    apply_changes = args.apply
+
+    root = Path.cwd()
+    print(f"Root: {root}")
+    print(f"Mode: {'APPLY' if apply_changes else 'DRY RUN'}")
+    print("Building workload...")
+
+    files = collect_files_under_subfolders(root)
+    total = len(files)
+    if total == 0:
+        print("No files found under subfolders. Nothing to do.")
+        return
+
+    print(f"Files discovered: {total}\n")
+
+    # PASS 1: remove all occurrences of KEY within stems
+    p1_changed, p1_removed = pass1_remove(root, files, apply_changes)
+    print(f"\nPASS 1 summary: changed={p1_changed}, key-occurrences-removed={p1_removed}")
+
+    # Refresh file list because some paths may have changed after PASS 1
+    files = collect_files_under_subfolders(root)
+
+    # PASS 2: enforce KEY as the filename prefix (exactly once)
+    p2_changed = pass2_prefix(root, files, apply_changes)
+    print(f"\nPASS 2 summary: changed={p2_changed}")
+
+    # Final recap
+    total_changes = p1_changed + p2_changed
+    if apply_changes:
+        print(f"\nAll done. Applied changes: {total_changes}")
+    else:
+        print(f"\nDry run complete. Would apply changes: {total_changes}")
+        print("Re-run with --apply to commit.")
+
 if __name__ == "__main__":
     main()
