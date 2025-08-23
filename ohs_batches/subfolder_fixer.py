@@ -1,36 +1,31 @@
 import os
 import shutil
-from tqdm import tqdm  # For progress bar
+from tqdm import tqdm  # for a progress bar
 
-# === Explanation for Non-Coders ===
-# This script does the following:
-# 1. Walks through every folder in a given "root" directory.
-# 2. If a folder named "Portfolio" exists, it takes all files inside it.
-# 3. Moves those files into the parent folder (one level up).
-# 4. Shows a progress bar with how many files are moved.
-
-# === Configuration ===
-# Change this to the top-level directory where all your folders are stored.
+# === CONFIGURATION ===
+# Change this to the top-level directory where your folders are stored
 root_directory = r"U:\General Portfolio"
 
-# === Step 1: Collect all portfolio files ===
-portfolio_files = []  # Will store (source, destination) pairs
+# === Step 1: Collect all Portfolio folders and files ===
+portfolio_tasks = []   # list of (source_file, destination_file)
+portfolio_folders = [] # list of portfolio folder paths
 
 for current_path, folders, files in os.walk(root_directory):
-    # Check if this is a "Portfolio" subdirectory
     if os.path.basename(current_path).lower() == "portfolio":
-        parent_dir = os.path.dirname(current_path)  # Go one level up
+        parent_dir = os.path.dirname(current_path)
+        portfolio_folders.append(current_path)
+
         for file in files:
-            source = os.path.join(current_path, file)       # Where the file is now
-            destination = os.path.join(parent_dir, file)    # Where it should go
-            portfolio_files.append((source, destination))   # Save for later moving
+            source = os.path.join(current_path, file)
+            destination = os.path.join(parent_dir, file)
+            portfolio_tasks.append((source, destination))
 
-# === Step 2: Move files with progress bar ===
-print(f"Found {len(portfolio_files)} files to move.\n")
+# === Step 2: Move files ===
+print(f"Found {len(portfolio_tasks)} file(s) to move from {len(portfolio_folders)} Portfolio folder(s).\n")
 
-for source, destination in tqdm(portfolio_files, desc="Moving files", unit="file"):
+for source, destination in tqdm(portfolio_tasks, desc="Moving files", unit="file"):
     try:
-        # If a file with same name already exists in parent, rename to avoid overwrite
+        # Ensure no overwrite — if a duplicate exists, rename with _1, _2...
         if os.path.exists(destination):
             base, ext = os.path.splitext(destination)
             counter = 1
@@ -40,8 +35,19 @@ for source, destination in tqdm(portfolio_files, desc="Moving files", unit="file
                 new_destination = f"{base}_{counter}{ext}"
             destination = new_destination
 
-        shutil.move(source, destination)  # Move the file
+        shutil.move(source, destination)
     except Exception as e:
-        print(f"Could not move {source}: {e}")
+        print(f"\nCould not move {source}: {e}")
 
-print("\nFile moving complete.")
+# === Step 3: Remove empty Portfolio folders ===
+for folder in portfolio_folders:
+    try:
+        if not os.listdir(folder):  # check if folder is empty
+            os.rmdir(folder)
+            print(f"Removed empty folder: {folder}")
+        else:
+            print(f"Skipped (not empty): {folder}")
+    except Exception as e:
+        print(f"Could not remove folder {folder}: {e}")
+
+print("\nCleanup complete.")
