@@ -1,408 +1,164 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-================================================================================
-PURPOSE
-================================================================================
-Rename each TOP-LEVEL folder in the current directory when its name equals a
-Legacy Person ID (8 digits) found in a CSV. The new folder name format is:
+# Rename <Legacy8>  →  <PID6>_<First-Last>_<Legacy8>
+# Strict: act only when a top-level folder named exactly <Legacy8> exists.
+# Row-driven, duplicate CSV rows auto-skip after first consumption.
+# Robust CSV decode + control-char stripping to avoid underscores artifact.
+# No suffixing; if target exists, skip.
+import argparse, csv, io, re, sys
+from pathlib import Path
 
-    <PersonID>_<Full Name>_<LegacyID>
-
-Examples
---------
-Before:  12345678
-After:   104942_Abdulraheem, Hanan_12345678
-
-Key Points
-----------
-- ONLY folders directly under the folder where you run this script are considered.
-- The script MATCHES a folder by normalizing its name to digits and requiring 8.
-- The CSV must have columns exactly:
-      "Person ID", "Full Name", "Legacy Person ID"
-- The script trims spaces:
-    * Leading/trailing spaces are removed from CSV fields.
-    * Multiple internal whitespace characters are collapsed to a single space.
-- Windows-safe naming:
-    * Illegal characters are replaced with underscores.
-    * Trailing dots/spaces are removed.
-    * Reserved device names (CON, NUL, COM1, etc.) are avoided.
-- The script NEVER overwrites: it adds "_1", "_2", ... if a collision occurs.
-- Default is DRY RUN (no changes). Add --apply to actually rename.
-
-USAGE
------
-1) Open PowerShell or CMD in the directory containing your target folders and CSV.
-2) Preview (no changes):
-       python rename_dirs_from_csv_prefix.py --csv "Person Query (1582 records) 2025-08-23.csv"
-3) Apply changes:
-       python rename_dirs_from_csv_prefix.py --csv "Person Query (1582 records) 2025-08-23.csv" --apply
-
-================================================================================
-"""
-
-# ==============================================================================
-# IMPORTS: standard-library only; no external dependencies
-# ==============================================================================
-import argparse      # Parse command-line options like --csv and --apply
-import csv           # Read the CSV file using column names
-import re            # Regular expressions for cleaning/sanitizing text
-from pathlib import Path  # Robust path handling across operating systems
-from typing import Dict, Tuple, Iterable  # Type hints for clarity (optional)
-
-
-# ==============================================================================
-# LOW-LEVEL TEXT UTILITIES
-# ==============================================================================
-
-# A. Characters that Windows forbids in file/folder names:
-#    < > : " / \ | ? * and ASCII control chars (0x00-0x1F).
+# ---------- Windows safety ----------
 WIN_ILLEGAL = r'<>:"/\\|?*\x00-\x1F'
-
-# Precompile regex that finds any illegal character (performance + clarity).
 _ILLEGAL_RE = re.compile(f"[{re.escape(WIN_ILLEGAL)}]")
-
-# Windows forbids trailing spaces or dots in names. This regex removes them.
 _TRAILING_RE = re.compile(r"[\. ]+$")
+_RESERVED = {"CON","PRN","AUX","NUL", *{f"COM{i}" for i in range(1,10)}, *{f"LPT{i}" for i in range(1,10)}}
 
-# Windows reserved device base names (case-insensitive). "COM1".."COM9", "LPT1".."LPT9".
-_RESERVED = {
-    "CON", "PRN", "AUX", "NUL",
-    *{f"COM{i}" for i in range(1, 10)},
-    *{f"LPT{i}" for i in range(1, 10)},
-}
-
-
-def digits_only(s: str) -> str:
-    """
-    PURPOSE
-    -------
-    Remove everything except digits 0-9.
-
-    WHY
-    ---
-    Folder names should match "Legacy Person ID" as 8 digits. Some names might
-    contain stray characters or spaces; this normalizes them.
-
-    EXAMPLE
-    -------
-    " 12 345 678 "  -> "12345678"
-    """
-    return re.sub(r"\D", "", s or "")
-
-
-def normalize_whitespace(s: str) -> str:
-    """
-    PURPOSE
-    -------
-    Trim leading/trailing whitespace AND collapse all internal whitespace runs
-    (spaces, tabs, newlines) to a single space.
-
-    EXAMPLES
-    --------
-    "  John   Q.   Public " -> "John Q. Public"
-    "Jane\tDoe"             -> "Jane Doe"
-    """
-    s = s or ""
-    # Strip ends
-    s = s.strip()
-    # Collapse any run of whitespace to a single space
-    s = re.sub(r"\s+", " ", s)
+def sanitize_component(s: str) -> str:
+    s = _ILLEGAL_RE.sub("_", s)
+    s = _TRAILING_RE.sub("", s)
+    if not s: s = "_"
+    if s.split(".",1)[0].upper() in _RESERVED: s += "_"
     return s
 
+# ---------- text cleaning ----------
+_CTRL_RE = re.compile(r"[\x00-\x1F]+")  # strip ASCII control chars
+def strip_ctrl(s: str) -> str:
+    return _CTRL_RE.sub("", s or "")
 
-def sanitize_component(name: str) -> str:
-    """
-    PURPOSE
-    -------
-    Make a path "component" (one folder name) safe on Windows.
+def norm_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
 
-    STEPS
-    -----
-    1) Replace illegal characters with underscores.
-    2) Remove any trailing dots/spaces at the end.
-    3) If the result is empty, use underscore.
-    4) If the base (before first dot) is a reserved device name (e.g., "CON"),
-       append underscore to avoid conflicts.
+def digits_only(s: str) -> str:
+    return re.sub(r"\D", "", s or "")
 
-    NOTE
-    ----
-    We KEEP spaces internally (Windows allows spaces), but we ensure they are
-    normalized beforehand via normalize_whitespace().
-    """
-    # Replace illegal characters
-    out = _ILLEGAL_RE.sub("_", name)
+def pid_six(s: str) -> str:
+    # remove all non-digits first, then take first 6 run
+    d = digits_only(s)
+    m = re.search(r"\d{6}", d)
+    return m.group(0) if m else ""
 
-    # Remove trailing dots/spaces
-    out = _TRAILING_RE.sub("", out)
+def first_dash_last(name: str) -> str:
+    n = norm_ws(strip_ctrl(name))
+    if ", " in n:
+        last, first = n.split(", ", 1)
+        return f"{first}-{last}"
+    return n
 
-    # Avoid empty component
-    if not out:
-        out = "_"
-
-    # Avoid reserved device names (consider the part before the first dot)
-    base_before_dot = out.split(".", 1)[0]
-    if base_before_dot.upper() in _RESERVED:
-        out = out + "_"
-
-    return out
-
-
-def ensure_unique_path(dst: Path) -> Path:
-    """
-    PURPOSE
-    -------
-    Guarantee that the returned path does NOT already exist. If 'dst' is free,
-    return it; otherwise append _1, _2, ... until a free name is found.
-
-    WHY
-    ---
-    Prevent accidental overwriting or collisions with existing folders.
-
-    EXAMPLE
-    -------
-    "104942_John Doe_12345678"
-    "104942_John Doe_12345678_1"
-    "104942_John Doe_12345678_2"
-    """
-    if not dst.exists():
-        return dst
-
-    # Work with the folder name. Folders typically have no extensions, but we
-    # handle "name.ext" generically just in case.
-    name = dst.name
-    if "." in name:
-        stem, ext = name.rsplit(".", 1)
-        dot = "."
+# ---------- CSV decoding ----------
+def decode_csv(csv_path: Path) -> io.StringIO:
+    b = csv_path.read_bytes()
+    if b.startswith((b"\xff\xfe", b"\xfe\xff")):
+        t = b.decode("utf-16")
+    elif b.count(b"\x00") > 0:
+        try: t = b.decode("utf-16-le")
+        except UnicodeDecodeError: t = b.decode("utf-16", errors="strict")
     else:
-        stem, ext, dot = name, "", ""
+        t = b.decode("utf-8-sig")
+    return io.StringIO(t)
 
-    n = 1
-    while True:
-        candidate = dst.with_name(f"{stem}_{n}{dot}{ext}")
-        if not candidate.exists():
-            return candidate
-        n += 1
+def hdrmap(fields):
+    m = {}
+    for h in fields or []:
+        key = re.sub(r"\s+", " ", (h or "")).strip().lower()
+        m[key] = h
+    return m
 
+# ---------- iterate CSV rows with 1-based indices ----------
+def iter_rows(csv_path: Path):
+    f = decode_csv(csv_path)
+    r = csv.DictReader(f)
+    h = hdrmap(r.fieldnames)
+    c_legacy = h.get("legacy person id")
+    c_pid    = h.get("person id")
+    c_name   = h.get("full name")
+    if not (c_legacy and c_pid and c_name):
+        print("ERROR: CSV needs headers: Person ID, Full Name, Legacy Person ID", file=sys.stderr)
+        return
+    row_idx = 1  # header
+    for row in r:
+        row_idx += 1
+        legacy = digits_only(strip_ctrl(row.get(c_legacy, "")))
+        if len(legacy) != 8:
+            yield (row_idx, None, None, None); continue
+        pid6 = pid_six(row.get(c_pid, ""))
+        if len(pid6) != 6:
+            yield (row_idx, legacy, None, None); continue
+        name = first_dash_last(row.get(c_name, ""))
+        yield (row_idx, legacy, pid6, name)
 
-# ==============================================================================
-# CSV LOADING
-# ==============================================================================
+def main():
+    ap = argparse.ArgumentParser(description="Rename <Legacy8> → <PID6>_<First-Last>_<Legacy8> with indexed skip report.")
+    ap.add_argument("--csv", required=True, help="Path to Person Query CSV")
+    ap.add_argument("--apply", action="store_true", help="Apply changes (default dry run)")
+    args = ap.parse_args()
 
-def load_person_map(csv_path: Path) -> Dict[str, Tuple[str, str]]:
-    """
-    PURPOSE
-    -------
-    Read the "Person Query" CSV and build a fast lookup (dictionary) keyed by
-    normalized 8-digit "Legacy Person ID". The value for each key is a tuple:
-        (Person ID, Full Name)
-
-    BEHAVIOR
-    --------
-    - We normalize "Legacy Person ID" using digits_only() and REQUIRE exactly
-      8 digits to keep the entry.
-    - We trim/collapse spaces in "Person ID" and "Full Name" using
-      normalize_whitespace().
-    - We DO NOT change case or punctuation of "Full Name"; we only sanitize
-      later when building the final folder name.
-
-    RETURNS
-    -------
-    Dict[str, Tuple[str, str]]
-      Mapping: "12345678" -> ("104942", "Abdulraheem, Hanan")
-    """
-    mapping: Dict[str, Tuple[str, str]] = {}
-
-    with csv_path.open("r", encoding="utf-8", errors="ignore", newline="") as f:
-        reader = csv.DictReader(f)  # Access columns by name
-
-        # Validate the expected columns exist. If they don't, DictReader
-        # will return None for missing keys; our get() handles that safely.
-        for row in reader:
-            legacy_raw = row.get("Legacy Person ID", "")
-            pid_raw    = row.get("Person ID", "")
-            name_raw   = row.get("Full Name", "")
-
-            # Normalize each field:
-            legacy = digits_only(legacy_raw)                 # keep only digits
-            pid    = normalize_whitespace(pid_raw)           # trim + collapse spaces
-            name   = normalize_whitespace(name_raw)          # trim + collapse spaces
-
-            # Keep ONLY rows with an 8-digit legacy ID
-            if len(legacy) != 8:
-                continue
-
-            mapping[legacy] = (pid, name)
-
-    return mapping
-
-
-# ==============================================================================
-# DIRECTORY ENUMERATION
-# ==============================================================================
-
-def top_level_dirs(root: Path) -> Iterable[Path]:
-    """
-    PURPOSE
-    -------
-    Yield every immediate subdirectory of 'root'. Files are ignored.
-
-    NOTE
-    ----
-    We DO NOT recurse. Only folders directly under 'root' are considered.
-    """
-    for p in root.iterdir():
-        if p.is_dir():
-            yield p
-
-
-# ==============================================================================
-# MAIN ORCHESTRATION
-# ==============================================================================
-
-def main() -> None:
-    """
-    CONTROL FLOW (step-by-step)
-    ---------------------------
-    1) Parse command-line arguments:
-         --csv   : required path to the Person Query CSV
-         --apply : optional flag to actually perform renames
-    2) Resolve the current working directory ("root") where the script runs.
-    3) Load the CSV mapping of legacy -> (person id, full name).
-    4) Scan immediate subfolders under 'root'.
-    5) For each subfolder:
-         a) Normalize its name to digits only.
-         b) If exactly 8 digits and present in CSV mapping, build the NEW name:
-               <PersonID>_<Full Name>_<LegacyID>
-            with all components trimmed and Windows-sanitized.
-         c) If the destination name already exists, add _1, _2, ...
-         d) Add this pair (src -> dst) to a plan list.
-    6) Report the plan (how many will be renamed; show first 50).
-    7) If --apply was given, perform the rename operations and report success/fail.
-       Otherwise, end after the dry-run preview.
-    """
-    # 1) Parse CLI args
-    parser = argparse.ArgumentParser(
-        description="Prefix top-level folders with PersonID and Full Name from CSV, keeping LegacyID at the end."
-    )
-    parser.add_argument(
-        "--csv",
-        required=True,
-        help="Path to the Person Query CSV with columns: 'Person ID', 'Full Name', 'Legacy Person ID'"
-    )
-    parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Actually perform the renames. If omitted, this is a dry run."
-    )
-    args = parser.parse_args()
-
-    # 2) Determine 'root' (where the script is run) and CSV path
     root = Path.cwd()
     csv_path = Path(args.csv)
-
-    # 2a) Basic existence check for the CSV
     if not csv_path.exists():
-        print(f"ERROR: CSV not found: {csv_path}")
-        return
+        print(f"ERROR: CSV not found: {csv_path}"); return
 
-    # 3) Load the mapping from CSV
-    person_map = load_person_map(csv_path)
-
-    # High-level status banner
     print(f"Working folder: {root}")
-    print(f"Usable CSV mappings (8-digit legacy keys): {len(person_map)}")
-    print(f"Mode: {'APPLY (will rename)' if args.apply else 'DRY RUN (no changes)'}\n")
+    print(f"Mode: {'APPLY' if args.apply else 'DRY RUN (no changes)'}\n")
 
-    # Statistics counters for transparency
-    planned = []            # list of (Path src, Path dst) to rename
-    skipped_non8 = 0        # folders whose names (digits-only) are not 8 digits
-    skipped_missing = 0     # folders with 8-digit names that are not in the CSV
-    skipped_already = 0     # folders already matching the intended name
+    # snapshot available exact legacy folders; consume as we go
+    available = {p.name for p in root.iterdir() if p.is_dir() and re.fullmatch(r"\d{8}", p.name)}
+    planned_names = set()  # to catch target collisions in dry-run
 
-    # 4) Enumerate top-level subdirectories
-    for d in top_level_dirs(root):
-        # Normalize the folder name to just digits to test if it is an 8-digit legacy
-        legacy = digits_only(d.name)
+    plan = []  # (src, dst, row_index)
+    rows_total = 0
+    skip_invalid_legacy = []
+    skip_invalid_pid = []
+    skip_no_dir = []
+    skip_target_exists = []
 
-        if len(legacy) != 8:
-            # Not an 8-digit "Legacy Person ID"; ignore this folder
-            skipped_non8 += 1
-            continue
+    for row_index, legacy, pid6, name in iter_rows(csv_path):
+        rows_total += 1
 
-        if legacy not in person_map:
-            # We have a plausible legacy folder, but there is no CSV match
-            skipped_missing += 1
-            continue
+        if legacy is None:
+            skip_invalid_legacy.append(row_index); continue
+        if pid6 is None:
+            skip_invalid_pid.append(row_index); continue
 
-        # 5) Build the new name using CSV data
-        person_id_raw, full_name_raw = person_map[legacy]
+        # exact match only
+        if legacy not in available:
+            skip_no_dir.append(row_index); continue
 
-        # Trim and collapse spaces in both pieces (safety + cleanliness)
-        person_id_norm = normalize_whitespace(person_id_raw)
-        full_name_norm = normalize_whitespace(full_name_raw)
+        dst_name = f"{pid6}_{sanitize_component(name)}_{legacy}"
+        if (root / dst_name).exists() or dst_name in planned_names:
+            skip_target_exists.append(row_index); continue
 
-        # Sanitize for Windows filesystem (illegal chars, trailing dots/spaces, reserved names)
-        safe_pid  = sanitize_component(person_id_norm)
-        safe_name = sanitize_component(full_name_norm)
+        src = root / legacy
+        dst = root / dst_name
+        plan.append((src, dst, row_index))
+        planned_names.add(dst_name)
+        available.remove(legacy)  # consume so later duplicates skip
 
-        # New folder name FORMAT:
-        #   <PersonID>_<Full Name>_<LegacyID>
-        new_name = f"{safe_pid}_{safe_name}_{legacy}"
+        if args.apply:
+            try:
+                src.rename(dst)
+            except Exception as e:
+                print(f"ERROR (row {row_index}): {src.name} -> {dst.name}: {e}")
+                planned_names.discard(dst_name)
+                available.add(legacy)
 
-        # Compute a destination path object under the same root
-        dst = ensure_unique_path(root / new_name)
+    print(f"CSV rows read:              {rows_total}")
+    print(f"Planned renames:            {len(plan)}")
+    print(f"Skipped (invalid legacy):   {len(skip_invalid_legacy)} -> {skip_invalid_legacy}")
+    print(f"Skipped (invalid personid): {len(skip_invalid_pid)}    -> {skip_invalid_pid}")
+    print(f"Skipped (no matching dir):  {len(skip_no_dir)}         -> {skip_no_dir}")
+    print(f"Skipped (target exists):    {len(skip_target_exists)}  -> {skip_target_exists}\n")
 
-        # If the computed destination name equals the current, nothing to do
-        if dst.name == d.name:
-            skipped_already += 1
-            continue
+    for src, dst, idx in plan[:50]:
+        print(f"row {idx}: {src.name} -> {dst.name}")
+    if len(plan) > 50:
+        print(f"...and {len(plan)-50} more")
 
-        # Add to the plan list
-        planned.append((d, dst))
+    if not plan:
+        print("\nNothing to rename."); return
+    if args.apply:
+        print("\nDone.")
+    else:
+        print("\nDry run complete. Re-run with --apply to commit.")
 
-    # 6) Report the plan for verification
-    print(f"Planned renames: {len(planned)}")
-    print(f"  Skipped (folder name not 8 digits): {skipped_non8}")
-    print(f"  Skipped (no CSV match):           {skipped_missing}")
-    print(f"  Skipped (already correct):        {skipped_already}\n")
-
-    # Show up to first 50 planned renames for quick inspection
-    for src, dst in planned[:50]:
-        print(f" - {src.name}  ->  {dst.name}")
-    if len(planned) > 50:
-        print(f"... and {len(planned)-50} more")
-
-    # If nothing to do, exit now
-    if not planned:
-        print("\nNothing to rename.")
-        return
-
-    # If this is DRY RUN, stop after preview
-    if not args.apply:
-        print("\nDry run complete. Re-run with --apply to commit changes.")
-        return
-
-    # 7) APPLY MODE: perform the renames
-    print("\nApplying renames...")
-    ok = 0
-    fail = 0
-
-    for src, dst in planned:
-        try:
-            # The actual rename on disk happens here
-            src.rename(dst)
-            ok += 1
-        except Exception as e:
-            # If something goes wrong (locked folder, permissions, etc.), record it and keep going
-            print(f"ERROR: {src.name} -> {dst.name}: {e}")
-            fail += 1
-
-    print(f"\nDone. Renamed: {ok}. Failed: {fail}.")
-
-
-# ==============================================================================
-# ENTRY POINT
-# ==============================================================================
 if __name__ == "__main__":
     main()
