@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""
+Split a multi-student transcript PDF into one PDF per student, named with the VC ID# from a roster spreadsheet.
+
+Matching policy:
+1) Match by last name, then evaluate given-name aliases:
+   - header given-block (can include multiple tokens, e.g., "mary heath")
+   - first token of roster First Name
+   - full roster First Name (may include middles)
+   - Preferred Name
+2) Boost if Preferred Name appears on the page.
+3) If confidence is low, corroborate with grade and address (street and city/state/zip).
+Deterministic accept: when there is exactly one roster candidate for the last name and the header full name
+equals either "<First Name> <Last>" or "<Preferred> <Last>" or "<header-given-block> <Last>".
+
+CLI:
+  python transcripterizer.py --pdf All_Transcripts.pdf --xlsx FactsStudentMatch.xlsx \
+      --out out_transcripts --log split_log.csv --progress line --continue-on-ambiguous --accept-unique
+
+Dependencies: pandas, openpyxl, PyMuPDF (fitz), tqdm (optional).
+"""
+
+import argparse
+import os
+import re
+import sys
+import unicodedata
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import List, Optional, Tuple
+
+import fitz  # PyMuPDF
+import pandas as pd
+
+# optional progress bar
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except Exception:
+    HAS_TQDM = False
+
+
+def norm(s: Optional[str]) -> str:
+    """Lowercase, strip accents, remove punctuation, collapse spaces."""
+    if s is None:
+        return ""
+    s = unicodedata.normalize("NFKD", str(s))
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+@dataclass
+class PdfStudentSlice:
+    start: int
+    end: int
+    name_full: str
+    street: str
+    city_state_zip: str
+    current_grade: str
+    page_text: str
+
+
+def detect_student_starts(doc: fitz.Document) -> List[int]:
+    starts = []
+    for i in range(doc.page_count):
+        t = doc.load_page(i).get_text("text")
+        first_line = t.splitlines()[0].strip() if t.strip() else ""
+        if first_line.startswith("Student: "):
+            starts.append(i)
+    if not starts:
+        # fallback: treat each page as its own slice
+        starts = list(range(doc.page_count))
+    return starts
+
+
+def extract_slice(doc: fitz.Document, start: int, end: int) -> PdfStudentSlice:
+    t = doc.load_page(start).get_text("text")
+    lines = [ln for ln in t.splitlines() if ln.strip()]
+    header = lines[0] if lines else ""
+    name_full = header.replace("Student:", "").strip()
+    street = lines[1].strip() if len(lines) > 2 else ""
+    citystzip = lines[2].strip() if len(lines) > 3 else ""
+    cg = ""
+    for ln in lines[:12]:
+        if ln.startswith("Current Grade:"):
+            cg = ln.split(":", 1)[1].strip()
+            break
+    page_text = t
+    return PdfStudentSlice(start, end, name_full, street, citystzip, cg, page_text)
+
+
+def parse_pdf(doc: fitz.Document) -> List[PdfStudentSlice]:
+    starts = detect_student_starts(doc)
+    slices: List[PdfStudentSlice] = []
+    for idx, s in enumerate(starts):
+        e = (starts[idx + 1] - 1) if idx + 1 < len(starts) else (doc.page_count - 1)
+        if e < s:
+            e = s
+        slices.append(extract_slice(doc, s, e))
+    return slices
+
+
+def load_roster(xlsx_path: str) -> pd.DataFrame:
+    df = pd.read_excel(xlsx_path, engine="openpyxl")
+    required = ["VC ID#", "First Name", "Last Name", "Preferred Name", "Grade Level", "Street", "City State Zip"]
+    for col in required:
+        if col not in df.columns:
+            raise ValueError(f"Missing column in roster: {col}")
+    df["_first_n"] = df["First Name"].map(norm)
+    df["_last_n"] = df["Last Name"].map(norm)
+    df["_pref_n"] = df["Preferred Name"].fillna("").map(norm)
+    df["_street_n"] = df["Street"].fillna("").map(norm)
+    df["_cityzip_n"] = df["City State Zip"].fillna("").map(norm)
+    df["_grade_n"] = df["Grade Level"].astype(str).str.replace(r"[^0-9]", "", regex=True)
+    return df
+
+
+def grade_digits(s: str) -> str:
+    return re.sub(r"[^0-9]", "", s or "")
+
+
+@lru_cache(None)
+def split_name_full(name_full: str) -> tuple[str, str, str]:
+    """Return (given_block, last, full_norm). given_block may contain middle(s)."""
+    nm = norm(name_full)
+    parts = nm.split()
+    if not parts:
+        return "", "", ""
+    last = parts[-1]
+    given_block = " ".join(parts[:-1])  # everything before last
+    return given_block, last, nm
+
+
+def _candidate_frame(pdf: PdfStudentSlice, roster: pd.DataFrame) -> pd.DataFrame:
+    given_block, pdf_last, _ = split_name_full(pdf.name_full)
+    page_norm = norm(pdf.page_text)
+
+    # primary candidate set: exact last-name equality
+    cand = roster[roster["_last_n"] == pdf_last].copy()
+    if cand.empty:
+        # light fallback: last contained in header
+        nm = norm(pdf.name_full)
+        cand = roster[roster["_last_n"].apply(lambda x: x in nm)].copy()
+    if cand.empty:
+        return cand
+
+    def name_aliases(row) -> set[str]:
+        first = row["_first_n"]              # can include middles
+        pref = row["_pref_n"]
+        aliases = set()
+        if first:
+            aliases.add(first)               # full given from roster
+            aliases.add(first.split()[0])    # first token
+        if pref:
+            aliases.add(pref)
+        return {a for a in aliases if a}
+
+    def score(row: pd.Series) -> float:
+        sc = 0.0
+        aliases = name_aliases(row)
+
+        # given-block equals an alias (handles multi-part first names)
+        if given_block and given_block in aliases:
+            sc += 1.0
+
+        # allow first-token equality if header has multiple given tokens
+        if given_block and given_block.split()[0] in aliases:
+            sc += 0.5
+
+        # preferred name present on page
+        if row["_pref_n"] and row["_pref_n"] in page_norm:
+            sc += 0.2
+
+        # corroboration signals
+        if pdf.current_grade:
+            pg = grade_digits(pdf.current_grade)
+            if pg and pg == row["_grade_n"]:
+                sc += 0.3
+        if row["_street_n"] and norm(pdf.street) == row["_street_n"]:
+            sc += 0.3
+        if row["_cityzip_n"] and norm(pdf.city_state_zip) == row["_cityzip_n"]:
+            sc += 0.3
+        return sc
+
+    cand["__score"] = cand.apply(score, axis=1)
+    cand.sort_values("__score", ascending=False, inplace=True)
+    return cand
+
+
+def choose_match(pdf: PdfStudentSlice, roster: pd.DataFrame, accept_unique: bool = False) -> Tuple[pd.Series, float]:
+    cand = _candidate_frame(pdf, roster)
+    if cand.empty:
+        raise RuntimeError(f"No roster candidates found for '{pdf.name_full}'")
+
+    top = cand.iloc[0]
+    top_score = float(top["__score"])
+    given_block, pdf_last, full_hdr = split_name_full(pdf.name_full)
+
+    # deterministic accept when only one candidate and header matches canonical forms
+    if len(cand) == 1:
+        roster_full = f"{norm(top['First Name'])} {top['_last_n']}".strip()
+        roster_pref_full = f"{top['_pref_n']} {top['_last_n']}".strip() if top["_pref_n"] else ""
+        if (
+            full_hdr == roster_full
+            or (roster_pref_full and full_hdr == roster_pref_full)
+            or (given_block and f"{given_block} {pdf_last}" == roster_full)
+        ):
+            return top, top_score
+        if accept_unique:
+            return top, top_score
+
+    # standard acceptance gates
+    second = float(cand["__score"].iloc[1]) if len(cand) > 1 else -1.0
+    delta = top_score - second
+    accept = (top_score >= 1.0) or (top_score >= 0.9 and delta >= 0.4)
+    if not accept:
+        strong = cand[
+            (cand["_grade_n"] == grade_digits(pdf.current_grade))
+            & (cand["_street_n"] == norm(pdf.street))
+            & (cand["_cityzip_n"] == norm(pdf.city_state_zip))
+        ]
+        if len(strong) == 1:
+            top = strong.iloc[0]
+            top_score = float(top["__score"])
+        else:
+            head = cand.head(3).apply(
+                lambda r: f"{r['First Name']} {r['Last Name']} | VC {r['VC ID#']} | score {r['__score']:.2f}",
+                axis=1,
+            ).tolist()
+            raise RuntimeError(
+                f"Ambiguous match for '{pdf.name_full}' pgs {pdf.start+1}-{pdf.end+1} | candidates: {head}"
+            )
+    return top, top_score
+
+
+def safe_vcid(v):
+    s = str(v)
+    s = re.sub(r"[^\d]", "", s)
+    if not s:
+        raise ValueError(f"Invalid VC ID#: {v!r}")
+    return s
+
+
+def write_slice(src_doc: fitz.Document, out_dir: str, slc: PdfStudentSlice, vcid: str):
+    dst = fitz.open()
+    dst.insert_pdf(src_doc, from_page=slc.start, to_page=slc.end)
+    out_path = os.path.join(out_dir, f"{vcid}.pdf")
+    dst.save(out_path)
+    dst.close()
+    return out_path
+
+
+def write_review(src_doc: fitz.Document, review_dir: str, slc: PdfStudentSlice, tag: str):
+    os.makedirs(review_dir, exist_ok=True)
+    dst = fitz.open()
+    dst.insert_pdf(src_doc, from_page=slc.start, to_page=slc.end)
+    base = norm(slc.name_full).replace(" ", "_") or f"pages_{slc.start+1}-{slc.end+1}"
+    out_path = os.path.join(review_dir, f"{base}_{tag}.pdf")
+    dst.save(out_path)
+    dst.close()
+    return out_path
+
+
+def run(pdf_path: str, xlsx_path: str, out_dir: str, log_csv: str, progress: str, continue_on_ambig: bool, accept_unique: bool):
+    os.makedirs(out_dir, exist_ok=True)
+    review_dir = os.path.join(out_dir, "needs_review")
+    roster = load_roster(xlsx_path)
+    src_doc = fitz.open(pdf_path)
+    slices = parse_pdf(src_doc)
+
+    n = len(slices)
+    print(f"Discovered {n} student slices from PDF. Pages: {src_doc.page_count}")
+    use_bar = progress == "bar" and HAS_TQDM
+    bar = tqdm(total=n, unit="student", ncols=80) if use_bar else None
+
+    records = []
+    counts = {"ok": 0, "ambiguous": 0, "error": 0}
+
+    for idx, slc in enumerate(slices, 1):
+        status = "ok"
+        reason = ""
+        vcid = ""
+        out_path = ""
+        score = float("nan")
+        try:
+            row, score = choose_match(slc, roster, accept_unique=accept_unique)
+            vcid = safe_vcid(row["VC ID#"])
+            out_path = write_slice(src_doc, out_dir, slc, vcid)
+            counts["ok"] += 1
+            line = f"{idx}/{n} OK | {slc.name_full} -> VC {vcid} | score {score:.2f} | pages {slc.start+1}-{slc.end+1}"
+        except RuntimeError as e:
+            msg = str(e)
+            status = "ambiguous" if "Ambiguous match" in msg else "error"
+            reason = msg
+            if status == "ambiguous":
+                counts["ambiguous"] += 1
+                review_path = write_review(src_doc, review_dir, slc, "ambiguous")
+                line = f"{idx}/{n} AMBIG | {slc.name_full} | {msg} | saved {review_path}"
+                if not continue_on_ambig:
+                    if bar:
+                        bar.close()
+                    print(line)
+                    src_doc.close()
+                    pd.DataFrame.from_records(records).to_csv(log_csv, index=False)
+                    print(f"Stopped on ambiguity. Wrote log to {log_csv}")
+                    raise
+            else:
+                counts["error"] += 1
+                review_path = write_review(src_doc, review_dir, slc, "error")
+                line = f"{idx}/{n} ERROR | {slc.name_full} | {msg} | saved {review_path}"
+
+        if bar:
+            bar.set_description_str(status.upper())
+            bar.update(1)
+        elif progress == "line":
+            print(line)
+
+        records.append(
+            {
+                "index": idx,
+                "status": status,
+                "reason": reason,
+                "pdf_start": slc.start,
+                "pdf_end": slc.end,
+                "pdf_name_header": slc.name_full,
+                "street": slc.street,
+                "city_state_zip": slc.city_state_zip,
+                "grade_header": slc.current_grade,
+                "vc_id": vcid,
+                "score": None if pd.isna(score) else round(score, 3),
+                "output_pdf": out_path,
+            }
+        )
+
+    if bar:
+        bar.close()
+    src_doc.close()
+    pd.DataFrame.from_records(records).to_csv(log_csv, index=False)
+
+    ok, amb, err = counts["ok"], counts["ambiguous"], counts["error"]
+    print(f"Done. OK={ok} Ambiguous={amb} Error={err}. Log: {log_csv}  Output: {out_dir}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Split transcripts PDF into one PDF per student named by VC ID#.")
+    ap.add_argument("--pdf", default="All_Transcripts.pdf", help="Path to the large transcripts PDF")
+    ap.add_argument("--xlsx", default="FactsStudentMatch.xlsx", help="Path to the roster Excel with VC IDs")
+    ap.add_argument("--out", default="out_transcripts", help="Output directory for individual PDFs")
+    ap.add_argument("--log", default="split_log.csv", help="Path to CSV log to write")
+    ap.add_argument("--progress", choices=["bar", "line", "none"], default="bar", help="Progress display mode")
+    ap.add_argument("--continue-on-ambiguous", action="store_true", help="Skip ambiguous slices into needs_review/")
+    ap.add_argument("--accept-unique", action="store_true", help="Accept a single roster candidate on deterministic full-name match")
+    args = ap.parse_args()
+    run(args.pdf, args.xlsx, args.out, args.log, args.progress, args.continue_on_ambiguous, args.accept_unique)
+
+
+if __name__ == "__main__":
+    main()
