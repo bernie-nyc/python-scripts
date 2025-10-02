@@ -1,69 +1,65 @@
 """
-fileindexer.py  —  FULLY COMMENTED VERSION (friendly for middle school CS students)
+fileindexer.py — FULLY COMMENTED (middle-school friendly) + safer renaming
 
-WHAT THIS PROGRAM DOES (in plain words):
----------------------------------------
-You have many folders, each named with an 8-digit student ID like "12305932".
-Inside each folder are files (PDFs and others). We want to rename the folder
-so it becomes: "12305932 - Last, First" (student's last and first name).
+WHAT THIS PROGRAM DOES:
+-----------------------
+You have a big folder full of student folders named like "12305932".
+Inside each student folder are files (PDFs, etc.). We want to rename each
+student folder to: "######## - Last, First" (example: "12305932 - Wynn, Hannah").
 
-HOW WE FIND THE NAME:
-1) We FIRST look at the NAMES of ALL the files in the folder.
-   - If any filename already contains a name like "Wynn, Hannah" or "Hannah Wynn",
-     we use that. This is fast and usually correct.
+HOW WE FIND THE NAME (for EACH student folder):
+1) Look at the NAMES of ALL files in that folder.
+   - If a filename already includes a name (like “Wynn, Hannah” or “Hannah Wynn”),
+     we use that.
+2) If we still don’t know the name, we look INSIDE ALL the PDFs.
+   - We read text from the first few pages and search for patterns like:
+       • “Student Name: Last, First”  (special rule for Data Verification Forms)
+       • “Last, First”
+       • “First Last” (we flip it to “Last, First”)
+3) We AVOID being tricked by generic words like “All Divisions, DVF”.
 
-2) If filenames are not helpful, we look INSIDE ALL the PDF files in that folder.
-   - We read a little bit of text from the first few pages.
-   - We try to find patterns like:
-       • "Student Name: Last, First" (this special rule is for Data Verification Forms)
-       • "Last, First"
-       • "First Last" (which we turn into "Last, First")
-   - We avoid getting tricked by generic words like "All Divisions, DVF".
+SAFETY / RELIABILITY:
+---------------------
+- A big list of “STOPWORDS” keeps non-name words out.
+- We “score” better-looking names (like ones that have a comma “Last, First”).
+- DRY_RUN mode shows what would happen WITHOUT renaming for real.
+- Safer renaming:
+  • We catch Windows “Access is denied” (WinError 5) which usually means a file
+    in that folder is open in another program (Explorer, PDF viewer, sync tool).
+  • We retry a few times with short pauses instead of crashing the whole run.
+  • If a target name exists already, we add " (1)", " (2)", etc.
 
-SAFETY:
-- We use a big list of “STOPWORDS” so non-name words don’t fool us.
-- We give higher points to very name-looking patterns like "Last, First".
-- We do a DRY RUN by default (it prints what it WOULD rename, but doesn’t
-  actually change anything). You can turn DRY_RUN to False to really rename.
-
-HOW TO RUN:
-- Put this file somewhere you can run it (like alongside your folders).
-- Make sure the ROOT path below points to the top folder with the 8-digit folders.
-- Run:  py .\fileindexer.py  (in PowerShell)
-
-NOTE:
-- This script prints lines like:
-    [DRY]  12305932 -> 12305932 - Wynn, Hannah
-  That shows “old name -> new name”. If DRY_RUN is False, it will actually rename.
+HOW TO USE:
+-----------
+1) Set ROOT (below) to the top “No_Match” folder with the student folders.
+2) Start with DRY_RUN = True (prints what it WOULD do).
+3) When happy, set DRY_RUN = False to actually rename.
+4) Close Explorer windows and any open files inside the folders before running,
+   to avoid “Access is denied” errors.
 """
 
-from pathlib import Path               # Path lets us work with folders/files easily
-import re                               # re is for Regular Expressions (pattern matching)
-from PyPDF2 import PdfReader            # PdfReader lets us read text from PDF files
+from pathlib import Path
+import re
+import time
+import os
+from PyPDF2 import PdfReader
 
 
 # ---------------------------- Settings ----------------------------
 
-# ROOT is the top folder that contains many 8-digit student folders.
-ROOT = Path(r"U:\General Portfolio\No_Match")
+ROOT = Path(r"U:\General Portfolio\No_Match")  # top-level folder that holds the 8-digit folders
+DRY_RUN = True                                  # True = preview only; False = actually rename
 
-# DRY_RUN = True means "don't actually rename"; just print what we would do.
-# Set to False to actually rename folders.
-DRY_RUN = True
+MAX_PDF_PAGES = 3                               # how many pages to read from each PDF (speeds things up)
+ID8 = re.compile(r"^\d{8}$")                    # matches folder names like "12345678"
 
-# When reading a PDF, how many pages do we scan for text?
-# We don’t need to read the whole file to find a name, and this saves time.
-MAX_PDF_PAGES = 3
-
-# This pattern matches exactly 8 digits (like "12345678").
-# We use it to decide which subfolders are student folders.
-ID8 = re.compile(r"^\d{8}$")
+# When trying to rename, we’ll retry if Windows says “Access is denied”
+RENAMING_RETRIES = 5
+RETRY_WAIT_SECONDS = 1.5                        # wait this many seconds between retries
 
 
-# ------------------ Noise words (single tokens) -------------------
-# STOPWORDS is a set (like a list, but faster for checking) of words that
-# should NOT appear in a real name. If we see these words, we’ll think
-# “this is probably not a student name.”
+# ------------------ Words we do NOT want in names -----------------
+
 STOPWORDS = {
     # admin/common labels
     "Address","Application","Admissions","Admission","Form","Forms","Report","Release","Records",
@@ -90,88 +86,69 @@ STOPWORDS = {
     "Last","First","Sample","Summary","Year","End",
 }
 
-# Some very short, but real last names we should allow (2-letter names are usually blocked).
+# allow legit two-letter last names (normally we reject <=2 letter tokens)
 SHORT_ALLOW = {"Li","Lu","Xu","Yu","Su","Wu","Ng","Ho","Hu","Ko","Do","He"}
 
 
-# ------------------------- Regex patterns -------------------------
-# A “regular expression” (regex) is a special pattern to match text.
-# NAME_PART matches one word of a name: starts with a capital letter and can include
-# letters, apostrophes, periods, or hyphens. Example: O'Neil, J.R., Anne-Marie, etc.
+# ------------------------- Patterns (Regex) ------------------------
+
+# NAME_PART is one “word” of a name: starts with capital letter and can include letters,
+# apostrophes, periods, or hyphens (e.g., O'Neil, J.R., Anne-Marie).
 NAME_PART = r"[A-Z][a-zA-Z'.\-]+"
 
-# Pattern for "Last, First" (the strongest signal for a name)
+# 1) “Last, First”
 PAT_COMMA = re.compile(rf"\b({NAME_PART}),\s*({NAME_PART}(?:\s+{NAME_PART})*)\b")
 
-# Pattern for "First Last" (we will flip it into "Last, First" later)
+# 2) “First Last”  (we’ll flip to “Last, First”)
 PAT_SPACE = re.compile(rf"\b({NAME_PART})\s+({NAME_PART}(?:\s+{NAME_PART})*)\b")
 
-# Pattern for "Last; First" (sometimes people use semicolons)
+# 3) “Last; First”
 PAT_SEMI  = re.compile(rf"\b({NAME_PART});\s*({NAME_PART}(?:\s+{NAME_PART})*)\b")
 
-# SPECIAL DVF (Data Verification Form) PATTERN:
-# On these forms, "Student Name: Last, First" is the rule you told us.
-# We match that exact style and grab the pieces.
+# Special DVF rule: “Student Name: Last, First”
 PAT_DVF = re.compile(
     rf"""
-    Student\s*'?s?\s*Name\s*[:\-]\s*                # looks for "Student Name:" with optional spaces
-    (?P<last>{NAME_PART}(?:\s+{NAME_PART})*)       # last name part(s)
-    \s*[;,]\s*                                     # a comma or semicolon between last and first
-    (?P<first>{NAME_PART}(?:\s+{NAME_PART})*)      # first name part(s)
+    Student\s*'?s?\s*Name\s*[:\-]\s*                # "Student Name:" (flexible spaces)
+    (?P<last>{NAME_PART}(?:\s+{NAME_PART})*)       # last name
+    \s*[;,]\s*
+    (?P<first>{NAME_PART}(?:\s+{NAME_PART})*)      # first name
     (?=\s*(?:$|[,;]|Grade(?:\s*:|\b)|Date(?:\s*:|\b)|Page\b|Lower\s+School|Data\s+Verification|Form\b))
     """,
     re.I | re.X
 )
 
-# CONTEXT_REJECT:
-# If our match is sitting near these words (like "Guardian" or "Contact Person's Name"),
-# it’s probably not the student’s name, so we ignore it.
+# If these words are near a match, it’s probably not the student name (skip it).
 CONTEXT_REJECT = re.compile(
     r"(Contact\s+Person'?s\s+Name|Guardian|Parent|Emergency|Student\s+Name\s*,?\s*Signature)"
     r"|(\bAddress\b|\bE-?mail\b|\bComments?\b|\bAbsence\b|\bInterim\b|\bBirth\b|\bCertificate)",
     re.I
 )
 
-# LABEL_TAIL:
-# Sometimes real names have unwanted labels stuck after them (like "Form" or "Grade").
-# This pattern helps us cut off those trailing labels.
+# Remove trailing labels like “… Form”, “… Grade”, etc., from a matched name.
 LABEL_TAIL = re.compile(r"\s+(Grade|Date|Page|Lower|School|Data|Verification|Form)\b.*$", re.I)
 
 
 # ------------------------- Small helpers --------------------------
 
 def collapse_ws(s: str) -> str:
-    """
-    Replace weird spaces and dashes with normal ones, and collapse multiple spaces into one.
-    This makes it easier to match names without being confused by strange characters.
-    """
-    s = s.replace("\u00A0"," ")  # non-breaking space -> normal space
-    # turn different dash types into a normal hyphen
-    s = s.replace("\u2010","-").replace("\u2011","-").replace("\u2013","-").replace("\u2014","-")
-    # replace any group of whitespace with a single space
+    """Normalize spaces/dashes so patterns match more easily."""
+    s = s.replace("\u00A0"," ")  # non-breaking space
+    s = (s.replace("\u2010","-").replace("\u2011","-")
+           .replace("\u2013","-").replace("\u2014","-"))
     return re.sub(r"\s+", " ", s)
 
 def norm_cap(s: str) -> str:
-    """
-    Normalize capitalization: "hANNAH" -> "Hannah".
-    We do this for each word in the string.
-    """
+    """Capitalize nicely: 'hANNAH wYNN' -> 'Hannah Wynn'."""
     return " ".join(p[:1].upper() + p[1:].lower() if p else p for p in s.split())
 
 def strip_labels(s: str) -> str:
-    """
-    Remove trailing labels like 'Form', 'Grade', etc. from the end of a name string.
-    """
+    """Cut off tail labels like 'Form', 'Grade', etc."""
     return LABEL_TAIL.sub("", s).strip()
 
 def token_ok(tok: str) -> bool:
     """
-    Decide if a single word (token) looks like it could be part of a real name.
-    Rules:
-      - No digits
-      - Not a STOPWORD (like 'Form' or 'Records')
-      - Very short tokens (<=2 chars) are usually bad unless they are in SHORT_ALLOW
-      - Very long ALL-CAPS tokens are suspicious (probably not a name)
+    Decide if one word could be part of a real name.
+    (No digits, not a STOPWORD, not random ALLCAPS, short words allowed only if in SHORT_ALLOW.)
     """
     if any(ch.isdigit() for ch in tok):
         return False
@@ -187,40 +164,29 @@ def token_ok(tok: str) -> bool:
     return True
 
 def looks_like_name(last: str, first: str) -> bool:
-    """
-    Check if 'last' and 'first' together pass our token_ok checks.
-    """
+    """Check every word in 'Last, First' with token_ok()."""
     toks = (last + " " + first).replace(",", " ").split()
     return all(token_ok(t) for t in toks)
 
 def score_candidate(last: str, first: str, *, source: str, dvf_hit: bool, had_comma: bool, near_anchor: bool) -> int:
     """
-    Give a numeric score to a possible (last, first) name.
-    Higher scores mean “more likely to be the correct student name”.
-
-    Rules that add points:
-      +6 if it used a comma "Last, First" (this is very name-like)
-      +4 if it was near helpful labels (anchors)
-      +2 if found in a filename (filenames are pretty trustworthy)
-      +1 if found in a PDF
-     +12 if it matched the special DVF rule ("Student Name: Last, First")
-
-    Small adjustments:
-      +1 if the name is short/normal length (under 4 words total)
-      -2 if the last name has spaces (multi-word last names are fine, but slightly riskier)
+    Give a higher score to more trustworthy matches.
+    - comma style “Last, First” is great
+    - being near good anchors helps
+    - filenames are trustworthy
+    - DVF rule is very strong
     """
-    score = 10  # base score
+    score = 10
     if had_comma:   score += 6
     if near_anchor: score += 4
     if source == "filename": score += 2
     if source == "pdf":      score += 1
     if dvf_hit:              score += 12
-    # name length preference
+
     parts = len((last + " " + first).split())
-    if parts <= 3:   score += 1
-    if parts >= 5:   score -= 2
-    # prefer single-word surnames a bit
-    if " " in last:  score -= 2
+    if parts <= 3: score += 1
+    if parts >= 5: score -= 2
+    if " " in last: score -= 2
     return score
 
 
@@ -228,31 +194,28 @@ def score_candidate(last: str, first: str, *, source: str, dvf_hit: bool, had_co
 
 def candidates_from_filename(fname: str):
     """
-    Look for names inside a FILE NAME (not the contents).
-    We try three patterns:
+    Search a FILE NAME for names (not the contents). We try patterns:
       1) Last, First
-      2) First Last  (we flip it to Last, First)
+      2) First Last  (flipped to Last, First)
       3) Last; First
-    For each match, we check if it looks like a real name and then yield a scored candidate.
+    We return every good-looking match with a score.
     """
-    # Path(...).stem gives the filename without the extension.
-    # We also replace _ and - with spaces, and collapse multiple spaces.
     base = collapse_ws(Path(fname).stem.replace("_"," ").replace("-"," "))
 
-    # 1) Prefer "Last, First"
+    # Last, First
     for m in PAT_COMMA.finditer(base):
         last, first = norm_cap(m.group(1)), norm_cap(m.group(2))
         if looks_like_name(last, first):
             yield (last, first, score_candidate(last, first, source="filename", dvf_hit=False, had_comma=True, near_anchor=False))
 
-    # 2) Also allow "First Last" (flip to Last, First)
+    # First Last (flip)
     for m in PAT_SPACE.finditer(base):
         f, l = norm_cap(m.group(1)), norm_cap(m.group(2))
         last, first = l, f
         if looks_like_name(last, first):
             yield (last, first, score_candidate(last, first, source="filename", dvf_hit=False, had_comma=False, near_anchor=False))
 
-    # 3) And "Last; First"
+    # Last; First
     for m in PAT_SEMI.finditer(base):
         last, first = norm_cap(m.group(1)), norm_cap(m.group(2))
         if looks_like_name(last, first):
@@ -263,8 +226,7 @@ def candidates_from_filename(fname: str):
 
 def pdf_text(pdf: Path, max_pages=MAX_PDF_PAGES) -> str:
     """
-    Read up to 'max_pages' pages of text from a PDF file and return it as one string.
-    If we fail to read the PDF, we return an empty string.
+    Read text from up to 'max_pages' of a PDF. If we can’t read it, return "".
     """
     try:
         r = PdfReader(str(pdf))
@@ -275,45 +237,38 @@ def pdf_text(pdf: Path, max_pages=MAX_PDF_PAGES) -> str:
         try:
             chunks.append(p.extract_text() or "")
         except Exception:
-            # If a page can’t be read, skip it.
             pass
-    # Join pages and clean up spaces/dashes for easier matching
     return collapse_ws(" ".join(chunks))
 
 def candidates_from_pdf(pdf: Path):
     """
-    Look for names INSIDE a PDF’s text.
-    Steps:
-      - Use the special DVF rule first: "Student Name: Last, First"
-      - Then try "Last, First", "Last; First", and "First Last"
-      - Ignore matches that sit near admin words (CONTEXT_REJECT)
-      - Score everything and return all candidates we find
+    Find names INSIDE a PDF:
+      - Try the special DVF rule (“Student Name: Last, First”).
+      - Then try general patterns (“Last, First”, “Last; First”, “First Last”).
+      - Ignore matches in bad contexts (like near “Guardian”).
     """
     blob = pdf_text(pdf)
     if not blob:
         return []
     out = []
 
-    # 1) Strong DVF rule (you told us DVFs always use Last, First after "Student Name:")
+    # Strong DVF rule first
     for m in PAT_DVF.finditer(blob):
         last = strip_labels(norm_cap(m.group("last")))
         first = strip_labels(norm_cap(m.group("first")))
         if looks_like_name(last, first):
             out.append((last, first, score_candidate(last, first, source="pdf", dvf_hit=True, had_comma=True, near_anchor=True)))
 
-    # 2) General fallbacks
+    # General patterns
     for pat, had_comma in ((PAT_COMMA, True), (PAT_SEMI, True), (PAT_SPACE, False)):
         for m in pat.finditer(blob):
-            # If the pattern has a comma/semi, group(1)=last, group(2)=first
             if had_comma:
                 last, first = norm_cap(m.group(1)), norm_cap(m.group(2))
             else:
-                # "First Last" -> flip to "Last, First"
                 f, l = norm_cap(m.group(1)), norm_cap(m.group(2))
                 last, first = l, f
 
-            # Take some surrounding text to check for bad context words.
-            ctx = blob[max(0, m.start()-80): m.end()+80]
+            ctx = blob[max(0, m.start()-80): m.end()+80]  # neighborhood text for context check
             if CONTEXT_REJECT.search(ctx):
                 continue
 
@@ -326,85 +281,92 @@ def candidates_from_pdf(pdf: Path):
 
 def pick_best(cands):
     """
-    We might find the SAME (last, first) pair multiple times with different scores.
-    This function:
-      1) Keeps only the HIGHEST score for each unique (last, first) pair.
-      2) Sorts by best score (highest first).
-      3) If scores tie, prefer fewer total words (shorter names are safer).
-      4) If still tied, prefer shorter total character length.
-    Returns:
-      (last, first) of the winner, or None if no candidates.
+    From many candidates (some duplicates), keep the highest score for each unique (last, first),
+    then sort and pick the winner.
     """
     if not cands:
         return None
 
-    # Keep the highest score for each unique name pair
     best = {}
     for last, first, sc in cands:
         key = (last, first)
         if key not in best or sc > best[key]:
             best[key] = sc
 
-    # Sort using our rules
     def sort_key(kv):
         (last, first), sc = kv
         tokens = len((last + " " + first).split())
         total_len = len(last.replace(" ","")) + len(first.replace(" ",""))
         return (-sc, tokens, total_len)
 
-    # Return the (last, first) with the best key
     return sorted(best.items(), key=sort_key)[0][0]
 
 
 # --------------------------- Renaming -----------------------------
 
 def target_name(id8: str, last_first):
-    """
-    Build the final folder name string: "######## - Last, First"
-    """
+    """Build final folder name like: '12345678 - Last, First'."""
     last, first = last_first
     return f"{id8} - {last}, {first}"
 
 def safe_rename(folder: Path, new_base: str):
     """
-    Actually rename the folder (or just print what we would do if DRY_RUN is True).
-
-    Safety checks:
-      - If the new name is exactly the same, do nothing.
-      - If a folder with the new name already exists, add " (1)", " (2)", etc.
+    Try to rename the folder safely.
+    - If the new name already exists, append " (1)", " (2)", ...
+    - If Windows says "Access is denied" (WinError 5), we retry a few times,
+      pausing between tries, and then give up gracefully (don’t crash the whole script).
     """
     target = folder.with_name(new_base)
 
-    # If it's already the same name, say so.
+    # No-op if already correct
     if target.name == folder.name:
         print(f"[SAME] {folder.name}")
         return
 
-    # Avoid collisions: if target exists, append (1), (2), ...
+    # Avoid name collisions
     if target.exists():
         i = 1
         while folder.with_name(f"{new_base} ({i})").exists():
             i += 1
         target = folder.with_name(f"{new_base} ({i})")
 
-    # Do the rename or just print it (DRY RUN)
     if DRY_RUN:
         print(f"[DRY]  {folder.name} -> {target.name}")
-    else:
-        folder.rename(target)
-        print(f"[OK]   {folder.name} -> {target.name}")
+        return
+
+    # Real rename with retries (helps when files are briefly “locked” by other apps)
+    last_err = None
+    for attempt in range(1, RENAMING_RETRIES + 1):
+        try:
+            folder.rename(target)
+            print(f"[OK]   {folder.name} -> {target.name}")
+            return
+        except PermissionError as e:
+            last_err = e
+            # On Windows, WinError 5 = “Access is denied”.
+            # Usually a file is open in Explorer, a PDF viewer, antivirus scan, or sync tool.
+            print(f"[WAIT] {folder.name} locked (attempt {attempt}/{RENAMING_RETRIES}). "
+                  f"Close files or Explorer windows. Retrying in {RETRY_WAIT_SECONDS}s...")
+            time.sleep(RETRY_WAIT_SECONDS)
+        except OSError as e:
+            # Other OS errors (print and stop retrying—usually won’t fix themselves)
+            print(f"[FAIL] {folder.name} -> {target.name}  ({e})")
+            return
+
+    # If we’re here, all retries failed with PermissionError.
+    print(f"[FAIL] {folder.name} -> {target.name}  (Access denied after retries: {last_err})")
 
 
 # ---------------------------- Main --------------------------------
 
 def derive_name_for_folder(folder: Path):
     """
-    This is the brain for one folder:
-      1) Look at ALL filenames in this folder for a good name.
-      2) If that fails, read INSIDE ALL PDFs in this folder to find a name.
-      3) Return the best (last, first) we can find, or None if nothing is reliable.
+    Figure out the student’s name for ONE folder.
+    1) Try ALL filenames.
+    2) If needed, look INSIDE ALL PDFs.
+    Return (last, first) or None.
     """
-    # --- Step 1: check ALL file NAMES first (fast and usually enough) ---
+    # Step 1: filenames
     file_name_cands = []
     for f in folder.iterdir():
         if f.is_file():
@@ -414,7 +376,7 @@ def derive_name_for_folder(folder: Path):
     if best_from_names:
         return best_from_names
 
-    # --- Step 2: if filenames failed, check INSIDE ALL PDFs ---
+    # Step 2: PDF contents
     pdf_cands = []
     for f in folder.iterdir():
         if f.is_file() and f.suffix.lower() == ".pdf":
@@ -424,30 +386,21 @@ def derive_name_for_folder(folder: Path):
 
 def main():
     """
-    Go through each item in ROOT.
-    If it’s a directory named with exactly 8 digits (like '12345678'),
-    try to figure out the student's name and rename the folder.
+    Walk through ROOT and process every subfolder named like 8 digits (e.g., "12345678").
+    For each one, try to find “Last, First” and rename the folder safely.
     """
     for child in ROOT.iterdir():
-        # Skip things that aren't folders
         if not child.is_dir():
             continue
-
-        # We only process folders with names like "12345678"
         if not ID8.fullmatch(child.name):
             continue
 
-        # Try to derive the name for this specific folder
         best = derive_name_for_folder(child)
-
         if best:
-            # If we found something, build the new folder name and rename safely
             safe_rename(child, target_name(child.name, best))
         else:
-            # If nothing looked reliable, we skip (and tell the user)
             print(f"[SKIP] {child.name}  no reliable name")
 
 
-# This runs 'main()' when the file is executed directly.
 if __name__ == "__main__":
     main()
