@@ -1,6 +1,4 @@
 """
-fileindexer.py — FULLY COMMENTED (middle-school friendly) with stronger junk filters
-
 WHAT THIS PROGRAM DOES
 ----------------------
 You have lots of student folders named with 8 digits like "12305932".
