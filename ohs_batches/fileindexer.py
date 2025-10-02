@@ -1,4 +1,6 @@
 """
+fileindexer.py — FULLY COMMENTED (middle-school friendly) with stronger junk filters
+
 WHAT THIS PROGRAM DOES
 ----------------------
 You have lots of student folders named with 8 digits like "12305932".
@@ -55,7 +57,7 @@ logging.getLogger("PyPDF2").setLevel(logging.ERROR)
 ROOT = Path(r"U:\General Portfolio\No_Match")
 
 # True = preview only (no actual rename). False = do the renames.
-DRY_RUN = True
+DRY_RUN = False
 
 # Read up to this many pages from each PDF when searching inside files.
 MAX_PDF_PAGES = 3
