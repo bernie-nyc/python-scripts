@@ -1,50 +1,44 @@
 """
-fileindexer.py — FULLY COMMENTED (middle-school friendly) + tougher noise filters
+fileindexer.py — FULLY COMMENTED (middle-school friendly) with stronger junk filters
 
 WHAT THIS PROGRAM DOES
 ----------------------
-You have a giant folder full of student folders named with 8 digits like "12305932".
-Inside each student folder are files (PDFs, etc.). We want to rename each student
-folder to: "######## - Last, First" (example: "12305932 - Wynn, Hannah").
+You have lots of student folders named with 8 digits like "12305932".
+Inside each folder are files (PDFs, etc.). We want to rename each folder to:
+"######## - Last, First"  (example: "12305932 - Wynn, Hannah").
 
-HOW WE FIND THE NAME (for EACH student folder)
-----------------------------------------------
+HOW WE FIND THE NAME (for EACH folder)
+--------------------------------------
 1) Look at the NAMES of ALL files in that folder.
-   - If a filename already includes a name (like “Wynn, Hannah—Immunizations.pdf”
-     or “Hannah Wynn.pdf”), we use that.
-2) If we still don’t know the name, we look INSIDE ALL the PDFs.
-   - We read text from the first few pages and search for patterns like:
-       • “Student Name: Last, First”  (special rule for Data Verification Forms)
-       • “Last, First”
-       • “First Last” (we flip it to “Last, First”)
-3) We AVOID being tricked by generic words like:
-   - “All Divisions, DVF”, “Admis Eval”, “Requestreocrds/Recordsrequest”,
-     “Soc Sec Card”, months/days (like “Month, Day”), class words (“English”),
-     and many other non-name tokens.
+   - If a filename contains a person name (like “Wynn, Hannah—Immunizations.pdf”
+     or “Hannah Wynn.pdf”), we use it.
+2) If that fails, look INSIDE ALL the PDFs (first few pages).
+   - Find patterns like “Last, First” or “First Last” (then flip to “Last, First”).
+   - Special rule for “Data Verification Form” (DVF): “Student Name: Last, First”.
+
+HOW WE AVOID BAD NAMES
+----------------------
+We block generic words from becoming names (case-insensitive):
+- Admin words: “verification”, “data”, “school”, “form”, “recordsrequest”, “releaseforrecords”,
+  “psat”, “medical”, “social security card”, months, weekdays, subjects, etc.
+- Obvious junk PAIRS like “verification, data” or “school, lower”.
+- If a token is in the STOPWORDS list, we drop it.
+- If, after cleaning, a side of the name is empty → reject.
 
 SAFETY / RELIABILITY
 --------------------
-- A big list of “STOPWORDS” keeps non-name words out (including typos like
-  “Requestreocrds”).
-- We “score” better-looking names (comma style “Last, First” earns a higher score).
-- DRY_RUN mode prints what would happen WITHOUT renaming for real.
+- We “score” better-looking name matches (comma style is good; DVF rule is very strong).
+- DRY_RUN mode prints changes without renaming.
 - Safer renaming:
-  • We catch Windows “Access is denied” (WinError 5) and retry a few times.
-  • If a target name already exists, we add " (1)", " (2)", etc.
+  • Retry a few times on Windows “Access is denied” (WinError 5).
+  • If the new name already exists, add " (1)", " (2)", etc.
 
 HOW TO USE
 ----------
-1) Set ROOT below to the top “No_Match” folder with the student folders.
-2) Start with DRY_RUN = True (preview only).
-3) When happy, set DRY_RUN = False to actually rename.
-4) Close Explorer windows and any open files inside the folders before running
-   to avoid “Access is denied” errors.
-
-NOTE ABOUT "unknown widths" LINES
----------------------------------
-If you see a bunch of “unknown widths : [0, IndirectObject(...)]” lines,
-they come from PDF parsing internals and are harmless. We lower PyPDF2 logging,
-but some PDFs still print noisy messages. It won’t affect results.
+1) Set ROOT below to your top folder.
+2) Start with DRY_RUN = True to preview.
+3) When happy, set DRY_RUN = False and run again.
+4) Close any Explorer windows or files open inside the folders to avoid lock errors.
 """
 
 from pathlib import Path
@@ -54,141 +48,151 @@ import os
 import logging
 from PyPDF2 import PdfReader
 
-# Quiet down PyPDF2 logs (some PDFs still print noisy lines; that’s OK).
+# Quiet PyPDF2 logs (some PDFs may still print harmless “unknown widths” lines).
 logging.getLogger("PyPDF2").setLevel(logging.ERROR)
-
 
 # ---------------------------- Settings ----------------------------
 
-# This is the top-level folder that holds all the 8-digit student folders.
+# Top folder containing the 8-digit student folders:
 ROOT = Path(r"U:\General Portfolio\No_Match")
 
-# True  = preview only (no renames, just print what would happen)
-# False = actually rename folders on disk
+# True = preview only (no actual rename). False = do the renames.
 DRY_RUN = True
 
-# Read at most this many pages from each PDF to find a name (to stay fast).
+# Read up to this many pages from each PDF when searching inside files.
 MAX_PDF_PAGES = 3
 
-# Folder names we consider as student folders: exactly 8 digits.
+# Subfolder must be exactly 8 digits to be considered a student folder.
 ID8 = re.compile(r"^\d{8}$")
 
-# When Windows says “Access is denied” on rename, try again a few times.
+# Retry counts for Windows "Access is denied" during rename.
 RENAMING_RETRIES = 5
 RETRY_WAIT_SECONDS = 1.5
 
-
-# ------------------ Words we do NOT want in names -----------------
-# If any of these show up in a candidate, we throw it out.
-# (We include subject words, months, weekdays, admin words, and common noise.)
-STOPWORDS = {
+# ------------------ Stopwords / Banned tokens (case-insensitive) ------------------
+# All entries are lower-case; we compare using .lower() so “PSAT”, “Psat”, “psat” all match.
+STOPWORDS_LOWER = {
     # admin/common
-    "Address","Application","Admissions","Admission","Admin","Administrative","Administration",
-    "Form","Forms","Report","Release","Records","Record","Request","Requests","Authorization",
-    "Agreement","Information","Transcript","Transcripts","Testing","Tests","Scores","Interim",
-    "Interims","Conference","Conferences","Consent","Plan","Accommodation","Accomodation",
-    "Health","Immunization","Immunizations","Phys","Phy","Evaluation","Evaluations","Eval",
-    "Schedule","Status","Number","Phone","Comments","Absence","Absences","Birth","Certificate",
-    "Certificates","Faxed","Documents","Sent","Standardized","Gifted","PSAT","Bc","Im","Imm",
-    "Rc","Pt","St","Jk","DVF","Dvf","Division","Divisions","All","Student",
+    "address","application","admissions","admission","admin","administrative","administration",
+    "form","forms","report","release","records","record","request","requests","authorization",
+    "agreement","information","transcript","transcripts","testing","tests","scores","interim",
+    "interims","conference","conferences","consent","plan","accommodation","accomodation",
+    "acommodation",  # common misspellings
+    "health","immunization","immunizations","phys","phy","evaluation","evaluations","eval",
+    "schedule","status","number","phone","comments","absence","absences","birth","certificate",
+    "faxed","documents","sent","standardized","gifted","psat","bc","im","imm","rc","pt","stk",
+    "dvf","division","divisions","all","student",
 
     # contact/guardian labels
-    "Contact","Person","Persons","Guardian","Parent","Emergency","Subject","Please",
+    "contact","person","persons","guardian","parent","emergency","subject","please",
 
-    # frequent campus/subject words
-    "Service","Hours","Community","Athletic","Event","Trip","Training","Weight","Creative","Writing",
-    "Science","Government","History","Chinese","English","American","Teacher","Pre-ap","AP","Honors",
-    "Honor","Roll","Kindergarten","Junior","Kindergarten,","Sample",
+    # subjects / campus-y words
+    "service","hours","community","athletic","event","trip","training","weight","creative","writing",
+    "science","government","history","chinese","english","american","teacher","pre-ap","ap","honors",
+    "honor","roll","kindergarten","junior","sample",
 
     # school/org/place noise
-    "Oak","Hall","Hall's","Tampa","Gainesville","Meridian","Yonge","P.k.","P.k","P.K.","PK","PK.",
+    "school","lower","upper","middle","oak","hall","hall's","tampa","gainesville","meridian","yonge",
+    "p.k.","p.k","pk","pk.",
 
     # address bits
-    "Street","St","Avenue","Ave","Road","Rd","Lane","Ln","Court","Ct","Drive","Dr","Boulevard","Blvd",
-    "Suite","Ste","Apt","SW","NW","NE","SE",
+    "street","st","avenue","ave","road","rd","lane","ln","court","ct","drive","dr","boulevard","blvd",
+    "suite","ste","apt","sw","nw","ne","se",
 
     # generic placeholders / traps
-    "Last","First","Name",
+    "last","first","name","signature",
 
-    # test/program words
-    "Iowa","PSAT","SAT","ACT","Math","Eng","English","Physical","PE","Pt","Eval","Student","Sample",
+    # tests/program words
+    "iowa","sat","act","math","eng","physical","pe","eval","sample",
 
     # social security card bits
-    "Soc","Sec","Card","Social","Security",
+    "soc","sec","card","social","security",
 
-    # months (so we don't get “Month, Day” as a fake name)
-    "January","February","March","April","May","June","July","August","September","October",
-    "November","December","Jan","Feb","Mar","Apr","Jun","Jul","Aug","Sep","Sept","Oct","Nov","Dec",
+    # months (block “month, day” fake names)
+    "january","february","march","april","may","june","july","august","september","october",
+    "november","december","jan","feb","mar","apr","jun","jul","aug","sep","sept","oct","nov","dec",
 
     # weekdays
-    "Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday",
-    "Mon","Tue","Tues","Wed","Thu","Thur","Thurs","Fri","Sat","Sun",
+    "monday","tuesday","wednesday","thursday","friday","saturday","sunday",
+    "mon","tue","tues","wed","thu","thur","thurs","fri","sat","sun",
 
-    # common fused or misspelled admin blobs we’ve seen in filenames
-    "Recordsrequest","Recordrequest","Requestrecords","Requestreocrds",
-    "Recordreleaseauthorization","Recordrelease","Recordsrelease",
-    "Administering","Administered","Admis","AdmisEval","AdmisEval,", "SocSec","SocSecCard",
+    # known fused or misspelled admin blobs
+    "recordsrequest","recordrequest","requestrecords","requestreocrds",
+    "recordreleaseauthorization","recordrelease","recordsrelease",
+    "administering","administered","admis","admis eval","admiseval","socsec","socseccard",
+
+    # other junk we saw in outputs
+    "verification","data","medical","flvs","lms","justice","press","squats","president",
+    "representative","average","avg","score","test","releaseforrecords","requestreocrds",
 }
 
-# allow legit two-letter last names (normally we reject <=2 letter tokens)
-SHORT_ALLOW = {"Li","Lu","Xu","Yu","Su","Wu","Ng","Ho","Hu","Ko","Do","He"}
+# HARD reject pairs like (“verification”, “data”) regardless of anything else.
+BAD_PAIR_LOWER = {
+    ("verification", "data"),
+    ("school", "lower"),
+    ("lower", "school"),
+    ("score", "test"),
+    ("average", "avg"),
+    ("student", "name"),
+}
 
-# allow common suffixes
-SUFFIX_ALLOW = {"Jr","Sr","II","III","IV","V"}
+# allow legit two-letter surnames
+SHORT_ALLOW = {"li","lu","xu","yu","su","wu","ng","ho","hu","ko","do","he"}
 
+# common suffixes
+SUFFIX_ALLOW = {"jr","sr","ii","iii","iv","v"}
 
 # ------------------------- Patterns (Regex) ------------------------
 
-# NAME_PART is one “word” of a name: starts with capital letter and can include letters,
-# apostrophes, periods, or hyphens (e.g., O'Neil, J.R., Anne-Marie).
+# One “word” of a name: starts with a capital; may contain letters, apostrophes, periods, hyphens.
 NAME_PART = r"[A-Z][a-zA-Z'.\-]+"
 
 # 1) “Last, First”
 PAT_COMMA = re.compile(rf"\b({NAME_PART}),\s*({NAME_PART}(?:\s+{NAME_PART})*)\b")
 
-# 2) “First Last”  (we’ll flip to “Last, First”)
+# 2) “First Last” (we’ll flip to “Last, First”)
 PAT_SPACE = re.compile(rf"\b({NAME_PART})\s+({NAME_PART}(?:\s+{NAME_PART})*)\b")
 
 # 3) “Last; First”
 PAT_SEMI  = re.compile(rf"\b({NAME_PART});\s*({NAME_PART}(?:\s+{NAME_PART})*)\b")
 
-# Special DVF rule: “Student Name: Last, First”
+# Special DVF rule: “Student Name: Last, First” with typical words following it.
 PAT_DVF = re.compile(
     rf"""
-    Student\s*'?s?\s*Name\s*[:\-]\s*                # "Student Name:" (flexible spaces)
-    (?P<last>{NAME_PART}(?:\s+{NAME_PART})*)       # last name
+    Student\s*'?s?\s*Name\s*[:\-]\s*
+    (?P<last>{NAME_PART}(?:\s+{NAME_PART})*)
     \s*[;,]\s*
-    (?P<first>{NAME_PART}(?:\s+{NAME_PART})*)      # first name
+    (?P<first>{NAME_PART}(?:\s+{NAME_PART})*)
     (?=\s*(?:$|[,;]|Grade(?:\s*:|\b)|Date(?:\s*:|\b)|Page\b|Lower\s+School|Data\s+Verification|Form\b))
     """,
     re.I | re.X
 )
 
-# If these words are near a match INSIDE a PDF, it’s probably not the student name (skip it).
+# If these appear near a match in a PDF, it’s probably not the student’s name.
 CONTEXT_REJECT = re.compile(
     r"(Contact\s+Person'?s\s+Name|Guardian|Parent|Emergency|Student\s+Name\s*,?\s*Signature)"
     r"|(\bAddress\b|\bE-?mail\b|\bComments?\b|\bAbsence\b|\bInterim\b|\bBirth\b|\bCertificate)"
     r"|(\bAdmission(?:s)?\b|\bAdministering\b|\bEvaluation(?:s)?\b|\bEval\b)"
-    r"|(\bRecord(?:s)?(?:request|release|authorization)\b|\bRequestreocrds\b|\bRequestrecords\b)",
+    r"|(\bRecord(?:s)?(?:request|release|authorization)\b|\bRequestreocrds\b|\bRequestrecords\b)"
+    r"|(\bData\s+Verification\b|\bLower\s+School\b|\bVerification\b|\bForm\b)",
     re.I
 )
 
-# Remove trailing labels from a detected name (extra safety cleanup).
+# Remove trailing labels from detected sides (extra cleanup). Made more flexible.
 LABEL_TAIL = re.compile(
-    r"\s+(Grade|Date|Page|Lower|School|Data|Verification|Form|Admission(?:s)?|Administering|"
-    r"Evaluation(?:s)?|Eval|Records?request|Requestreocrds|Recordrelease(?:authorization)?|"
-    r"Soc(?:ial)?\s*Sec(?:urity)?\s*Card|Iowa|English|Math)\b.*$",
+    r"\s+(grade|date|page|lower|school|data|verification|form|admission(?:s)?|administering|"
+    r"evaluation(?:s)?|eval|records?request|requestreocrds|recordrelease(?:authorization)?|"
+    r"soc(?:ial)?\s*sec(?:urity)?\s*card|iowa|english|math|medical|physical)\b.*$",
     re.I
 )
 
-# Pre-clean obvious garbage phrases out of FILENAMES before we scan them.
+# Pre-clean obvious garbage phrases from FILENAMES before scanning for names.
 FILENAME_NOISE = re.compile(
     r"\b(All\s+Divisions?,?\s*DVF|DVF|Admission(?:s)?\s+Eval(?:uation)?s?|Administering|"
     r"Records?request|Requestreocrds|Recordrelease(?:authorization)?|Soc(?:ial)?\s*Sec(?:urity)?\s*Card|"
-    r"Iowa|English|Math)\b",
+    r"Iowa|English|Math|Data\s+Verification|Lower\s+School|Student\s+Name)\b",
     re.I
 )
-
 
 # ------------------------- Small helpers --------------------------
 
@@ -197,70 +201,103 @@ def collapse_ws(s: str) -> str:
     s = s.replace("\u00A0"," ")  # non-breaking space
     s = (s.replace("\u2010","-").replace("\u2011","-")
            .replace("\u2013","-").replace("\u2014","-"))
-    return re.sub(r"\s+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
 
 def norm_cap(s: str) -> str:
     """Capitalize nicely: 'hANNAH wYNN' -> 'Hannah Wynn'."""
     return " ".join(p[:1].upper() + p[1:].lower() if p else p for p in s.split())
 
-def strip_labels(s: str) -> str:
-    """Cut off tail labels like 'Form', 'Eval', 'Iowa', etc."""
-    return LABEL_TAIL.sub("", s).strip()
+def is_stopword_token(tok: str) -> bool:
+    """Case-insensitive stopword check."""
+    return tok.lower() in STOPWORDS_LOWER
+
+def strip_labels(side: str) -> str:
+    """
+    Remove trailing labels like 'Form', 'Eval', 'Iowa', 'Medical', etc.
+    Also, if the entire side is just a stopword (e.g., 'School'), blank it out.
+    """
+    side = side.strip()
+    if not side:
+        return side
+    # remove trailing label chunks
+    side = LABEL_TAIL.sub("", side).strip()
+    # if the whole side is a stopword, drop it
+    if is_stopword_token(side):
+        return ""
+    return side
 
 def token_ok(tok: str) -> bool:
     """
-    Decide if one word could be part of a real name.
-    (No digits, not a STOPWORD, not random ALLCAPS, short words allowed only if in SHORT_ALLOW.)
+    Is this word allowed to be part of a real name?
+    - No digits
+    - Not a stopword
+    - Very short (<=2) only allowed if in SHORT_ALLOW
+    - Not random ALLCAPS (except short pieces)
     """
     if not tok:
         return False
     if any(ch.isdigit() for ch in tok):
         return False
-    if tok in STOPWORDS:
+    tlo = tok.lower()
+    if tlo in STOPWORDS_LOWER:
         return False
-    if len(tok) <= 2 and tok not in SHORT_ALLOW and tok not in SUFFIX_ALLOW:
+    if len(tlo) <= 2 and tlo not in SHORT_ALLOW and tlo not in {s.lower() for s in SUFFIX_ALLOW}:
         return False
     if tok.isupper() and len(tok) > 3:
         return False
-    t = tok.lower()
-    if t in {"email","e-mail"}:
+    if tlo in {"email","e-mail"}:
         return False
     return True
 
 def clean_name_side(side_text: str) -> str:
     """
-    Clean one side of a name (“Last” OR “First Middle”).
-    - Remove trailing labels/phrases (like 'Form', 'Eval', 'Iowa', etc.)
-    - Keep only tokens that look like real name pieces.
-    - Allow suffixes like Jr, III.
-    If nothing is left, return "".
+    Clean one side of a name (“Last” OR “First Middle”):
+    - Remove trailing labels (strip_labels)
+    - Keep only tokens that look like real name pieces
+    - Allow suffixes like Jr, III
+    If nothing real remains, return "".
     """
     side_text = strip_labels(side_text)
     tokens = side_text.replace(",", " ").split()
     keep = []
     for t in tokens:
-        # normalize caps (so 'MCDONALD' -> 'Mcdonald', keep apostrophes/hyphens)
-        t = t[:1].upper() + t[1:] if t else t
-        if t in SUFFIX_ALLOW or token_ok(t):
-            keep.append(t)
+        # normalize caps (keep apostrophes/hyphens)
+        t_norm = t[:1].upper() + t[1:] if t else t
+        tlo = t_norm.lower()
+        if tlo in {s.lower() for s in SUFFIX_ALLOW} or token_ok(t_norm):
+            keep.append(t_norm)
     return " ".join(keep)
 
 def looks_like_name(last: str, first: str) -> bool:
-    """Check every word in 'Last, First' with token_ok(), after cleaning."""
+    """
+    Final test for “Last, First” after cleaning:
+    - Both sides must still have content
+    - Neither side can be a lone stopword
+    - Pair cannot be in BAD_PAIR_LOWER (e.g., "verification, data")
+    - Every token must pass token_ok or be a suffix
+    """
     last = clean_name_side(last)
     first = clean_name_side(first)
     if not last or not first:
         return False
+
+    last_lo = last.lower()
+    first_lo = first.lower()
+    if (last_lo, first_lo) in BAD_PAIR_LOWER:
+        return False
+
     toks = (last + " " + first).replace(",", " ").split()
-    return all(token_ok(t) or t in SUFFIX_ALLOW for t in toks)
+    if not all(token_ok(t) or t.lower() in {s.lower() for s in SUFFIX_ALLOW} for t in toks):
+        return False
+    return True
 
 def score_candidate(last: str, first: str, *, source: str, dvf_hit: bool, had_comma: bool, near_anchor: bool) -> int:
     """
-    Give a higher score to more trustworthy matches.
-    - comma style “Last, First” is great
-    - being near good anchors helps
-    - filenames are trustworthy
-    - DVF rule is very strong
+    Score how trustworthy a candidate is:
+    + comma style helps
+    + near good anchors helps
+    + DVF rule is very strong
+    + filenames are somewhat strong; PDFs are fine too
     """
     score = 10
     if had_comma:   score += 6
@@ -275,32 +312,32 @@ def score_candidate(last: str, first: str, *, source: str, dvf_hit: bool, had_co
     if " " in last: score -= 2
     return score
 
-
 # ------------------- Filename-based extraction --------------------
 
 def preclean_filename_text(raw: str) -> str:
     """
     Remove obvious garbage phrases from a filename BEFORE scanning for names.
-    Example: “Wynn, Hannah - Immunizations.pdf” stays the same,
-             but “… Admis Eval …” or “… Recordsrequest …” get scrubbed.
+    Example: “Wynn, Hannah - Immunizations.pdf” stays useful, but
+             “... Data Verification ...”, “... Lower School ...”, etc., are scrubbed.
     """
     base = Path(raw).stem
-    # turn underscores/dashes into spaces so patterns see words
+    # turn underscores/dashes into spaces to expose words
     base = base.replace("_"," ").replace("-"," ")
     base = collapse_ws(base)
     # delete obvious noise chunks
     base = FILENAME_NOISE.sub("", base)
-    # collapse extra spaces again after deletions
+    # collapse extra spaces again
     base = collapse_ws(base)
     return base
 
 def candidates_from_filename(fname: str):
     """
-    Search a FILE NAME for names (not the contents). We try patterns:
+    Find names in the FILE NAME (not the contents).
+    We try:
       1) Last, First
       2) First Last  (we flip to Last, First)
       3) Last; First
-    We return every good-looking match with a score.
+    Return every good-looking match with a score.
     """
     base = preclean_filename_text(fname)
 
@@ -326,13 +363,10 @@ def candidates_from_filename(fname: str):
             yield (clean_name_side(last), clean_name_side(first),
                    score_candidate(last, first, source="filename", dvf_hit=False, had_comma=True, near_anchor=False))
 
-
 # -------------------- PDF-based extraction ------------------------
 
 def pdf_text(pdf: Path, max_pages=MAX_PDF_PAGES) -> str:
-    """
-    Read text from up to 'max_pages' of a PDF. If we can’t read it, return "".
-    """
+    """Read text from up to 'max_pages' of a PDF. If reading fails, return ""."""
     try:
         r = PdfReader(str(pdf))
     except Exception:
@@ -348,10 +382,10 @@ def pdf_text(pdf: Path, max_pages=MAX_PDF_PAGES) -> str:
 def candidates_from_pdf(pdf: Path):
     """
     Find names INSIDE a PDF:
-      - Try the special DVF rule (“Student Name: Last, First”).
-      - Then try general patterns (“Last, First”, “Last; First”, “First Last”).
-      - Ignore matches in bad contexts (like near “Guardian”, “Admission Eval”, etc.).
-      - Clean out trailing labels like “Form”, “Iowa”, “Soc Sec Card”, etc.
+      - Special DVF rule (“Student Name: Last, First”).
+      - General patterns (“Last, First”, “Last; First”, “First Last”).
+      - Reject if near bad context words (guardian, address, etc.).
+      - Clean out trailing labels like “Form”, “Iowa”, “PSAT”, “Medical”.
     """
     blob = pdf_text(pdf)
     if not blob:
@@ -387,12 +421,11 @@ def candidates_from_pdf(pdf: Path):
                             score_candidate(last_clean, first_clean, source="pdf", dvf_hit=False, had_comma=had_comma, near_anchor=False)))
     return out
 
-
 # -------------------- Picking the best match ----------------------
 
 def pick_best(cands):
     """
-    From many candidates (some duplicates), keep the highest score for each unique (last, first),
+    From many candidates, keep the highest score for each unique (last, first),
     then sort and pick the winner.
     """
     if not cands:
@@ -412,7 +445,6 @@ def pick_best(cands):
 
     return sorted(best.items(), key=sort_key)[0][0]
 
-
 # --------------------------- Renaming -----------------------------
 
 def target_name(id8: str, last_first):
@@ -424,8 +456,8 @@ def safe_rename(folder: Path, new_base: str):
     """
     Try to rename the folder safely.
     - If the new name already exists, append " (1)", " (2)", ...
-    - If Windows says "Access is denied" (WinError 5), we retry a few times,
-      pausing between tries, and then give up gracefully (don’t crash the whole script).
+    - If Windows says "Access is denied" (WinError 5), retry a few times.
+    - Fail gracefully instead of crashing the whole script.
     """
     target = folder.with_name(new_base)
 
@@ -445,7 +477,6 @@ def safe_rename(folder: Path, new_base: str):
         print(f"[DRY]  {folder.name} -> {target.name}")
         return
 
-    # Real rename with retries (helps when files are briefly “locked” by other apps)
     last_err = None
     for attempt in range(1, RENAMING_RETRIES + 1):
         try:
@@ -461,9 +492,7 @@ def safe_rename(folder: Path, new_base: str):
             print(f"[FAIL] {folder.name} -> {target.name}  ({e})")
             return
 
-    # If we’re here, all retries failed with PermissionError.
     print(f"[FAIL] {folder.name} -> {target.name}  (Access denied after retries: {last_err})")
-
 
 # ---------------------------- Main --------------------------------
 
@@ -472,8 +501,8 @@ def derive_name_for_folder(folder: Path):
     Figure out the student’s name for ONE folder.
 
     IMPORTANT: We check ALL files in the folder.
-      1) Try ALL filenames first (fast and often most accurate).
-      2) If needed, look INSIDE ALL PDFs (slower, but powerful).
+      1) Try ALL filenames first (fast).
+      2) If needed, look INSIDE ALL PDFs (slower but powerful).
 
     Return (last, first) or None.
     """
@@ -511,7 +540,6 @@ def main():
             safe_rename(child, target_name(child.name, best))
         else:
             print(f"[SKIP] {child.name}  no reliable name")
-
 
 if __name__ == "__main__":
     main()
