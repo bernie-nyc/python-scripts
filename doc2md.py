@@ -1,160 +1,101 @@
 #!/usr/bin/env python3
 """
-DOC/DOCX -> Markdown Converter (recursive, run-from-here)
+doc2md.py - Convert all Word documents in the script's folder (and subfolders) to Markdown.
 
-What this script does:
-- Looks in the folder where THIS script is sitting (and all subfolders).
-- Finds every Word file that ends with .doc or .docx.
-- Converts each one into a .md (Markdown) file.
-- Saves results into a new folder next to the script: ./markdown_out/
-- Also pulls out pictures from the Word files into folders inside ./markdown_out/
+Default behavior (no arguments):
+- Recurses from the folder where this script file lives.
+- Converts every .doc and .docx it finds.
+- Writes Markdown into: <script_folder>/markdown_out/
+- Extracts embedded media into per-file folders inside markdown_out.
 
-Important notes (simple):
-- Pandoc does the actual converting.
-- .doc files (older Word format) might fail unless Pandoc can read them on your machine.
-  If .doc fails, you can convert those files to .docx in Word first.
+Optional overrides:
+- --input  : choose a different starting folder to scan
+- --output : choose a different output folder
+- --no-mirror : do NOT mirror subfolders (flatten into output folder)
+- --media-suffix : change the extracted media folder suffix
 
 Requirements:
-- Install pandoc and make sure the command "pandoc" works in Terminal / Command Prompt.
+- pandoc installed and available as "pandoc"
 - pip install pypandoc
-
-Run:
-- python doc_to_md.py
 """
 
 from __future__ import annotations
 
-# These are built-in Python tools (they come with Python).
-import shutil          # Helps us check if a program exists on the computer (pandoc).
-import sys             # Lets us exit with an error code if something goes wrong.
-from pathlib import Path  # A clean way to work with files and folders (paths).
+import argparse
+import shutil
+import sys
+from pathlib import Path
 
-# This is the extra library we install with pip.
-# It lets Python call Pandoc without us building command strings by hand.
 import pypandoc
 
 
-# ----------------------------
-# Step 1: Make sure Pandoc exists
-# ----------------------------
 def ensure_pandoc_available() -> None:
-    """
-    Pandoc is a separate program (not part of Python).
-    This function checks: "Can the computer find a program named 'pandoc'?"
-
-    If it cannot, we stop the script and show a clear message.
-    """
+    """Stop early if Pandoc isn't installed or not on PATH."""
     if shutil.which("pandoc") is None:
         raise RuntimeError(
-            "pandoc not found. Install pandoc and make sure 'pandoc' works in your terminal."
+            "pandoc not found on PATH. Install pandoc and ensure the 'pandoc' command works."
         )
 
 
-# ----------------------------
-# Step 2: Find Word files (recursive)
-# ----------------------------
 def iter_word_files(root_folder: Path) -> list[Path]:
     """
-    This searches through the folder and every subfolder.
+    Recursively collect .doc and .docx files under root_folder.
 
-    It returns a list of paths that end with:
-    - .docx (newer Word files)
-    - .doc  (older Word files)
-
-    We also skip weird temporary Word files that start with "~$"
-    because those are not real documents (Word creates them while editing).
+    Skips Word's temporary lock files that start with '~$'.
     """
-    word_files: list[Path] = []
-
-    # Look for .docx files anywhere under root_folder.
-    for p in root_folder.rglob("*.docx"):
-        if p.is_file() and not p.name.startswith("~$"):
-            word_files.append(p)
-
-    # Look for .doc files anywhere under root_folder.
-    for p in root_folder.rglob("*.doc"):
-        if p.is_file() and not p.name.startswith("~$"):
-            word_files.append(p)
-
-    # Sort the list so the output is predictable (same order each run).
-    return sorted(word_files)
+    files: list[Path] = []
+    for ext in ("*.docx", "*.doc"):
+        for p in root_folder.rglob(ext):
+            if p.is_file() and not p.name.startswith("~$"):
+                files.append(p)
+    return sorted(files)
 
 
-# ----------------------------
-# Step 3: Convert ONE Word file to Markdown
-# ----------------------------
 def convert_word_to_markdown(
     word_path: Path,
+    input_root: Path,
     output_root: Path,
-    script_root: Path,
-    media_suffix: str = "media",
+    mirror_subdirs: bool,
+    media_suffix: str,
 ) -> Path:
     """
-    Convert a single Word document into Markdown.
+    Convert one Word file to Markdown.
 
-    Inputs:
-    - word_path: the Word file we are converting
-    - output_root: the folder where we put Markdown results (./markdown_out)
-    - script_root: the folder where this script is located (the "starting point")
-    - media_suffix: a label used for the folder where pictures are extracted
-
-    What we do:
-    1) We recreate the same subfolder structure inside markdown_out.
-       Example:
-         If the Word file is:  ./notes/meetings/week1.docx
-         Then the Markdown goes: ./markdown_out/notes/meetings/week1.md
-
-    2) We also extract images to a folder next to the .md file:
-         ./markdown_out/notes/meetings/week1_media/
+    Folder rules:
+    - If mirror_subdirs=True, recreate the input folder structure under output_root.
+      Example:
+        input_root/notes/a.docx -> output_root/notes/a.md
+    - If mirror_subdirs=False, put everything directly in output_root (flatten).
     """
-    # Figure out the Word file’s location *relative* to the script folder.
-    # Example:
-    #   script_root = /home/me/project
-    #   word_path   = /home/me/project/notes/a.docx
-    #   relative    = notes/a.docx
-    relative_path = word_path.relative_to(script_root)
+    # Decide where this file's Markdown should go.
+    if mirror_subdirs:
+        # Keep the same subfolder layout under the output folder.
+        rel_parent = word_path.parent.relative_to(input_root)
+        out_dir = output_root / rel_parent
+    else:
+        # Put every Markdown file directly into the output folder.
+        out_dir = output_root
 
-    # Create the output folder path that matches the input structure.
-    # Example:
-    #   output_root = /home/me/project/markdown_out
-    #   relative_path.parent = notes
-    #   output_dir = /home/me/project/markdown_out/notes
-    output_dir = output_root / relative_path.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Make sure that folder exists.
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Markdown file path: same base name, but .md extension.
+    out_md = out_dir / f"{word_path.stem}.md"
 
-    # The Markdown filename should match the Word filename but end in .md
-    # Example: a.docx -> a.md
-    output_md_path = output_dir / f"{word_path.stem}.md"
+    # Media extraction folder: "<stem>_<suffix>" next to the .md file.
+    out_media = out_dir / f"{word_path.stem}_{media_suffix}"
+    out_media.mkdir(parents=True, exist_ok=True)
 
-    # Create a folder for extracted images and other embedded files.
-    # Example: a_media
-    media_dir = output_dir / f"{word_path.stem}_{media_suffix}"
-    media_dir.mkdir(parents=True, exist_ok=True)
+    # Input format for Pandoc depends on file extension.
+    # Note: .doc support can vary by system; if it fails, convert to .docx first.
+    suffix = word_path.suffix.lower()
+    input_format = "docx" if suffix == ".docx" else "doc"
 
-    # These are extra instructions we pass to Pandoc.
     extra_args = [
-        "--wrap=none",                 # Do not hard-wrap lines at a certain width.
-        "--extract-media", str(media_dir),  # Save images and media to this folder.
+        "--wrap=none",
+        "--extract-media",
+        str(out_media),
     ]
 
-    # Pandoc needs to know what format we want:
-    # - "gfm" means GitHub-Flavored Markdown.
-    # - The input format is based on file type.
-    #
-    # We set input format explicitly:
-    # - If it ends with .docx, use "docx"
-    # - If it ends with .doc, use "doc" (may or may not work depending on your setup)
-    if word_path.suffix.lower() == ".docx":
-        input_format = "docx"
-    else:
-        input_format = "doc"  # Warning: older .doc files can fail on some systems.
-
-    # This is the main conversion:
-    # - convert_file reads the Word file
-    # - Pandoc converts it
-    # - We get back Markdown text as a Python string
     md_text: str = pypandoc.convert_file(
         str(word_path),
         to="gfm",
@@ -162,91 +103,141 @@ def convert_word_to_markdown(
         extra_args=extra_args,
     )
 
-    # Write that Markdown text into the .md file.
-    output_md_path.write_text(md_text, encoding="utf-8")
-
-    # Return the path to the new Markdown file (useful for printing/logging).
-    return output_md_path
+    out_md.write_text(md_text, encoding="utf-8")
+    return out_md
 
 
-# ----------------------------
-# Step 4: Main program (the part that runs)
-# ----------------------------
+def build_arg_parser() -> argparse.ArgumentParser:
+    """
+    Build command line options.
+
+    Key point:
+    - No required positional arguments.
+    - Running 'python3 doc2md.py' should work with defaults.
+    """
+    parser = argparse.ArgumentParser(
+        prog="doc2md.py",
+        description="Recursively convert .doc/.docx files to Markdown.",
+    )
+
+    parser.add_argument(
+        "--input",
+        type=Path,
+        default=None,
+        help="Folder to scan. Default: the folder where doc2md.py is located.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Folder to write Markdown into. Default: <script_folder>/markdown_out",
+    )
+    parser.add_argument(
+        "--no-mirror",
+        action="store_true",
+        help="Do not mirror subfolders. Flatten all .md outputs into the output folder.",
+    )
+    parser.add_argument(
+        "--media-suffix",
+        default="media",
+        help="Suffix used for extracted media folders (default: media).",
+    )
+
+    return parser
+
+
 def main() -> int:
     """
-    This is the "controller" function.
+    Orchestrates the whole run.
 
-    Big picture:
-    - Decide what folder to scan (the script's folder).
-    - Create an output folder.
-    - Find Word files.
-    - Convert each one.
-    - Print results.
-    - Return an exit code:
-        0 = success
-        1 = some files failed
-        2 = setup problem (like missing folder)
+    Process (in order):
+    1) Decide input folder (default: where the script lives).
+    2) Decide output folder (default: <script_folder>/markdown_out).
+    3) Find Word files.
+    4) Convert them one by one.
+    5) Print a summary and return an exit code.
     """
-    # Find the folder where this script is located.
-    # Path(__file__) is the path to this script file.
-    # .resolve() makes it an absolute path (no ".." parts).
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    # Where is this script file located?
     script_path = Path(__file__).resolve()
-    script_root = script_path.parent
+    script_folder = script_path.parent
 
-    # Decide where outputs will go.
-    output_root = script_root / "markdown_out"
+    # Default input: the script's folder (NOT the current working directory).
+    input_root = (args.input or script_folder).resolve()
 
-    # Make sure Pandoc exists before doing anything else.
+    # Default output: a "markdown_out" folder next to the script.
+    output_root = (args.output or (script_folder / "markdown_out")).resolve()
+
+    # Mirror subfolders unless user disables it.
+    mirror_subdirs = not args.no_mirror
+    media_suffix = args.media_suffix
+
     ensure_pandoc_available()
 
-    # Find all Word files under the script folder.
-    word_files = iter_word_files(script_root)
+    if not input_root.exists() or not input_root.is_dir():
+        print(f"Input folder not found or not a directory: {input_root}", file=sys.stderr)
+        return 2
 
-    # If there are none, we just tell the user and exit normally.
+    word_files = iter_word_files(input_root)
     if not word_files:
-        print(f"No .doc or .docx files found under: {script_root}")
+        print(f"No .doc or .docx files found under: {input_root}")
         return 0
 
-    # Make sure the main output folder exists.
     output_root.mkdir(parents=True, exist_ok=True)
 
-    # Keep track of how many succeed and which ones fail.
-    converted_count = 0
+    converted = 0
     failures: list[tuple[Path, str]] = []
 
-    # Convert each Word file.
     for word_path in word_files:
         try:
             out_md = convert_word_to_markdown(
                 word_path=word_path,
+                input_root=input_root,
                 output_root=output_root,
-                script_root=script_root,
+                mirror_subdirs=mirror_subdirs,
+                media_suffix=media_suffix,
             )
-            converted_count += 1
-            print(f"OK  {word_path.relative_to(script_root)} -> {out_md.relative_to(script_root)}")
+            converted += 1
+
+            # Print nice relative paths when possible (easier to read).
+            try:
+                in_rel = word_path.relative_to(input_root)
+            except Exception:
+                in_rel = word_path
+
+            try:
+                out_rel = out_md.relative_to(script_folder)
+            except Exception:
+                out_rel = out_md
+
+            print(f"OK  {in_rel} -> {out_rel}")
+
         except Exception as e:
-            # If something goes wrong for this file, we record the error and keep going.
             failures.append((word_path, str(e)))
-            print(f"ERR {word_path.relative_to(script_root)}: {e}", file=sys.stderr)
+            try:
+                in_rel = word_path.relative_to(input_root)
+            except Exception:
+                in_rel = word_path
+            print(f"ERR {in_rel}: {e}", file=sys.stderr)
 
-    # Summary at the end.
-    total = len(word_files)
-    print(f"\nConverted: {converted_count}/{total}")
-    print(f"Output folder: {output_root}")
+    print(f"\nConverted: {converted}/{len(word_files)}")
+    print(f"Scanned:    {input_root}")
+    print(f"Output:     {output_root}")
 
-    # If any failed, print a list and return error code 1.
     if failures:
         print("\nFailures:", file=sys.stderr)
         for path, err in failures:
-            print(f"  - {path.relative_to(script_root)}: {err}", file=sys.stderr)
+            try:
+                in_rel = path.relative_to(input_root)
+            except Exception:
+                in_rel = path
+            print(f"  - {in_rel}: {err}", file=sys.stderr)
         return 1
 
-    # All good.
     return 0
 
 
-# This is the standard Python way to say:
-# "Only run main() if this file is being executed directly,
-#  not if it is being imported by another Python file."
 if __name__ == "__main__":
     raise SystemExit(main())
