@@ -30,10 +30,25 @@ import pypandoc
 
 
 def ensure_pandoc_available() -> None:
-    """Stop early if Pandoc isn't installed or not on PATH."""
-    if shutil.which("pandoc") is None:
+    """
+    Verify that pandoc is available to pypandoc.
+
+    Why this exists:
+    - shutil.which("pandoc") is unreliable in virtualenvs, conda,
+      snap installs, and user-local installs.
+    - pypandoc already knows how to locate pandoc correctly.
+    """
+    try:
+        pandoc_path = pypandoc.get_pandoc_path()
+    except OSError as e:
         raise RuntimeError(
-            "pandoc not found on PATH. Install pandoc and ensure the 'pandoc' command works."
+            "pandoc is not available to pypandoc. "
+            "Install pandoc or ensure it is discoverable."
+        ) from e
+
+    if not pandoc_path:
+        raise RuntimeError(
+            "pypandoc could not locate pandoc, even though it is installed."
         )
 
 
